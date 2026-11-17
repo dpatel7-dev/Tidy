@@ -30,14 +30,17 @@ The easiest way is Project CLI Access: run `pca`, pick **tidy**, press Enter.
 Or on its own, on a Mac or Linux (Terminal):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dpatel7-dev/tidy/main/install.sh | sh
+curl -fsSL https://djp7.pythonanywhere.com/tidy/install.sh | sh
 ```
 
 On Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/dpatel7-dev/tidy/main/install.ps1 | iex
+irm https://djp7.pythonanywhere.com/tidy/install.ps1 | iex
 ```
+
+(Or straight from GitHub: `curl -fsSL https://raw.githubusercontent.com/dpatel7-dev/tidy/main/install.sh | sh`.)
+Tree of Thought can open it too: **Tab → Tidy a folder**.
 
 ## Which AI it uses
 
