@@ -29,18 +29,24 @@ async function models() {
   const mine = await P.ollamaModels();
   for (const m of mine || []) if (!/embed/i.test(m.name)) out.push({ provider: 'ollama', id: m.name, name: m.name, size: m.size });
   for (const m of totCfg.garden || []) {
-    if (m.provider === 'ollama' || out.some((x) => keyOf(x) === keyOf(m))) continue;
-    if (P.PROVIDERS[m.provider] && keys[m.provider]) out.push({ provider: m.provider, id: m.id, name: m.name });
+    if (m.provider === 'ollama' || m.provider === 'auto' || out.some((x) => keyOf(x) === keyOf(m))) continue;
+    if (P.PROVIDERS[m.provider] && keys[m.provider]) out.push({ provider: m.provider, id: m.id, name: m.name, free: !!m.free, power: m.power || 0 });
   }
   return out;
 }
 
-/** The model to use: the one you picked, else the biggest one on this computer, else Tree of Thought's current one. */
+/**
+ * The model to use: the one you picked; else the strongest free cloud model
+ * from Tree of Thought (tot free); else the biggest one on this computer;
+ * else Tree of Thought's current one.
+ */
 async function current() {
   const all = await models();
   const pick = config.load().model;
   const chosen = pick && all.find((m) => keyOf(m) === pick);
   if (chosen) return { model: chosen, all };
+  const free = all.filter((m) => m.free && !local(m)).sort((a, b) => (b.power || 0) - (a.power || 0));
+  if (free.length) return { model: free[0], all };
   const locals = all.filter(local).sort((a, b) => (b.size || 0) - (a.size || 0));
   if (locals.length) return { model: locals[0], all };
   const totCfg = readJson(path.join(totHome(), 'config.json'), {});
@@ -88,8 +94,20 @@ async function ask(model, system, user, { signal } = {}) {
     return (j.message && j.message.content) || '';
   }
   const keys = readJson(path.join(totHome(), 'keys.json'), {});
-  const r = await P.chat({ provider: model.provider, key: keys[model.provider], model: model.id, system, messages: [{ role: 'user', content: user }], signal });
-  return r.text;
+  // a free model that's busy or over its limit hands over to another free one
+  const others = model.free ? (await models()).filter((m) => m.free && !local(m) && keyOf(m) !== keyOf(model)).sort((a, b) => (b.power || 0) - (a.power || 0)) : [];
+  let last;
+  for (const m of [model, ...others].slice(0, 4)) {
+    try {
+      const r = await P.chat({ provider: m.provider, key: keys[m.provider], model: m.id, system, messages: [{ role: 'user', content: user }], signal });
+      return r.text;
+    } catch (e) {
+      last = e;
+      const s = Number(e.status) || 0;
+      if (e.name === 'AbortError' || !(s === 429 || s >= 500 || (!s && /couldn't reach|cut off/i.test(e.message)))) throw e;
+    }
+  }
+  throw last;
 }
 
 module.exports = { models, current, choose, ask, askJson, parseJson, keyOf, local, config, home };

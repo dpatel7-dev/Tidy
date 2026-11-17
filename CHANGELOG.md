@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0
+- Uses Tree of Thought's free cloud models first (set them up with `tot free`), and moves on to another free model when one is busy or over its limit.
+- Knows the new services (NVIDIA, Ollama Cloud, SambaNova).
+
 ## 1.0.0 (2026-11-16)
 
 The first version.

@@ -46,13 +46,15 @@ Tree of Thought can open it too: **Tab → Tidy a folder**.
 
 tidy needs an AI, and it doesn't ask you to set up anything new:
 
-1. **A model on your own computer (best).** If [Ollama](https://ollama.com) is
-   installed with a model (`ollama pull llama3.2`, or `tot pull` in Tree of
-   Thought), tidy uses the biggest one. Nothing about your files leaves your
-   computer, and there's no limit on how often you can use it.
-2. **Tree of Thought's models.** If you've added keys in Tree of Thought, tidy
-   can use those models too. Before it sends anything, it tells you exactly
-   what it would send and asks first.
+1. **Tree of Thought's free models.** Set up free AI once with `tot free` (a
+   minute per service: copy a key and it's added). tidy uses the strongest of
+   those free cloud models, and if one is busy or over its limit, the next one.
+   Before anything is sent, tidy tells you exactly what (names, sizes, dates and
+   short snippets with secrets blanked out; private-looking files by name only)
+   and asks first.
+2. **Any other model in Tree of Thought**, if you pick it.
+3. **A model on your own computer** (optional, with [Ollama](https://ollama.com)):
+   nothing leaves your computer, but it uses your computer and is smaller.
 
 `tidy models` lists what it can use; `tidy model <name>` (or Ctrl+O on the
 screen) picks one.
@@ -110,7 +112,7 @@ TOT_URL_OLLAMA=http://127.0.0.1:11999/v1 TIDY_HOME=/tmp/tidy-try node bin/tidy.j
 | `src/scan.js` | looks at a folder safely: what to refuse, what to skip, what's private, redaction |
 | `src/plan.js` | asks the AI for folders and moves, and checks every suggestion |
 | `src/apply.js` | moves things (journal first) and undoes them |
-| `src/ai.js` | finds a model (Ollama first, then Tree of Thought's) and asks it for JSON |
+| `src/ai.js` | finds a model (Tree of Thought's free ones first) and asks it for JSON, moving on when one is busy |
 | `src/app.js` | the screen |
 | `src/hazel.js` | Hazel, in pixels |
 
