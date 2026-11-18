@@ -36,7 +36,35 @@ const nibble = (g) => g.map((r, y) => (y >= 9 && y <= 12 ? r.replace(/a/g, (m, i
 const sad = (g) => g.map((r) => r.replace('E', 'o')).map((r, y) => (y === 2 ? r.replace('oO.oO', 'oo.oo') : r));
 const sprout = (g) => S.dots(g, [[0, 14, 's'], [1, 13, 's'], [1, 15, 's']]);
 
+// A smaller Hazel for terminals that draw thin lines through half-blocks
+// (macOS Terminal): every pixel is a whole cell there, so she stays crisp.
+const MINI = [
+  '.TT.....O.O.',
+  'TTtT....OOOO',
+  'TT.TT..OOEON',
+  'T...T.OOOOOO',
+  '.T.TTOOCCOO.',
+  '..TTOOCCCAA.',
+  '..TTOOOCCaa.',
+  '...TOOOOOO..',
+  '....oo...oo.',
+];
+const mBlink = (g) => g.map((r) => r.replace('E', 'O'));
+const mFlick = (g) => g.map((r, y) => (y < 4 ? '.' + r.slice(0, 5) + r.slice(6) : r)); // just the tail swishes
+const mHop = (g) => ['............'].concat(g.slice(0, 8));
+const mNibble = (g) => g.map((r, y) => (y === 5 || y === 6 ? r.replace(/[Aa]/g, (m, i) => (i % 2 ? 'O' : m)) : r));
+const mSad = (g) => g.map((r) => r.replace('E', 'o')).map((r, y) => (y === 0 ? r.replace('O.O', '...') : r));
+const mThink = (g) => S.dots(g, [[11, 0, 'q']]);
+
 const f = (grid, ms = 260) => ({ grid, ms });
+const MINI_SCENES = {
+  idle: [f(MINI, 1400), f(mBlink(MINI), 150), f(MINI, 1200), f(mFlick(MINI), 260), f(MINI, 900)],
+  think: [f(MINI, 300), f(mThink(MINI), 300), f(mFlick(mThink(MINI)), 300), f(mBlink(MINI), 150)],
+  work: [f(MINI, 200), f(mNibble(MINI), 200), f(mFlick(MINI), 200), f(mNibble(MINI), 200)],
+  done: [f(mHop(MINI), 220), f(MINI, 220), f(mHop(MINI), 220), f(MINI, 1600)],
+  oops: [f(mSad(MINI), 1200), f(mBlink(mSad(MINI)), 160)],
+};
+const blocky = () => S.style() === 'blocky';
 const SCENES = {
   idle: [f(BASE, 1400), f(blink(BASE), 150), f(BASE, 1200), f(flick(BASE), 260), f(BASE, 900)],
   think: [f(think(BASE, 0), 300), f(think(BASE, 1), 300), f(think(BASE, 2), 500), f(think(flick(BASE), 2), 300), f(blink(think(BASE, 2)), 150)],
@@ -46,14 +74,19 @@ const SCENES = {
 };
 
 function frameAt(scene, ms) {
-  const frames = SCENES[scene] || SCENES.idle;
+  const set = blocky() ? MINI_SCENES : SCENES;
+  const frames = set[scene] || set.idle;
   const total = frames.reduce((n, x) => n + x.ms, 0);
   let at = ms % total;
   for (const fr of frames) { if (at < fr.ms) return fr.grid; at -= fr.ms; }
   return frames[0].grid;
 }
 
-const draw = (scene = 'idle', ms = 0, bg = Th.t().paper.bg) => S.draw(frameAt(scene, ms), ink(), { bg });
-const length = (scene) => (SCENES[scene] || SCENES.idle).reduce((n, x) => n + x.ms, 0);
+const draw = (scene = 'idle', ms = 0, bg = Th.t().paper.bg) => (blocky() ? S.drawBlocky : S.draw)(frameAt(scene, ms), ink(), { bg });
+const length = (scene) => { const set = blocky() ? MINI_SCENES : SCENES; return (set[scene] || set.idle).reduce((n, x) => n + x.ms, 0); };
 
-module.exports = { draw, length, BASE, ink, SCENES, WIDTH: 20, HEIGHT: 8 };
+module.exports = {
+  draw, length, BASE, MINI, ink, SCENES,
+  get WIDTH() { return blocky() ? MINI[0].length * 2 : 20; },
+  get HEIGHT() { return blocky() ? MINI.length : 8; },
+};

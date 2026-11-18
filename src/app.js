@@ -1,14 +1,22 @@
 'use strict';
 // tidy's screen.
 //
-//   [Hazel]  tidy                                  ~/Downloads · 214 things · 1.3 GB
-//            an AI that tidies folders, carefully          model: llama3.2 (this Mac)
-//   ───────────────────────────────────────────────────────────────────────────────
-//   (ask)     How should I tidy Downloads?  › sort by class, and put installers away
-//   (review)  46 moves into 7 folders · nothing deleted, nothing replaced
-//             School/ (12)   Games/ (8) …         [x] essay.docx → School/English/  "an essay"
-//   (done)    Moved 46 things.  u puts them all back.
+//   tidy  Downloads  ~/Downloads · 214 things · 1.3 GB                          1.2.0
+//   ──────────────────────────────────────────────────────────────────────────────
+//    By kind   By date   Ask the AI                          46 moves into 7 folders
+//    Loose files sorted by what they are. Folders you made stay as they are.
+//
+//    Installers/    8   › ● setup-tool.dmg                 → Installers/
+//    Screenshots/  12     ● Screenshot 2026-11-01.png      → Screenshots/
+//   ──────────────────────────────────────────────────────────────────────────────
+//    only moves · never deletes or replaces · u undoes
+//     enter  move 46 things    ←→ another way   space skip   tab other folder   esc quit
+//
+// "By kind" and "By date" need no AI, so they're ready the moment a folder
+// opens. "Ask the AI" is for anything they can't do ("by school subject").
+// One Enter moves what you see; u puts it all back.
 
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const A = require('./ansi');
@@ -18,30 +26,65 @@ const AI = require('./ai');
 const P = require('./providers');
 const Scan = require('./scan');
 const Plan = require('./plan');
+const Quick = require('./quick');
 const Run = require('./apply');
 const { Editor } = require('./editor');
-const { Tui, fit, spread, size, ago } = require('./tui');
+const { Tui, fit, spread, size, ago, bar } = require('./tui');
 const pkg = require('../package.json');
 
 const tilde = (p) => (p.startsWith(os.homedir()) ? '~' + p.slice(os.homedir().length) : p);
 const untilde = (p) => (p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
+
+const WAYS = [
+  { id: 'kind', name: 'By kind', hue: 'acorn' },
+  { id: 'date', name: 'By date', hue: 'sky' },
+  { id: 'ai', name: 'Ask the AI', hue: 'berry' },
+];
+// ready-made requests for the AI: [what it's told, what you see]
+const IDEAS = [
+  ['', 'Tidy it up sensibly'],
+  ['sort by school subject', 'By school subject'],
+  ['group things by project or topic', 'By project or topic'],
+  ['photos and screenshots by year, everything else by what it is', 'Photos by year, the rest by kind'],
+  ["put anything older than a year into one folder called Old stuff", 'Old things into one folder'],
+];
+const HUES = ['acorn', 'moss', 'sky', 'berry', 'warn', 'plum', 'teal', 'cream', 'clay'];
+const SPIN = ['◐', '◓', '◑', '◒'];
+
+/** k of colour a, the rest b (both #rrggbb). */
+function mix(a, b, k) {
+  const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+  const [x, y] = [p(a), p(b)];
+  return '#' + x.map((v, i) => Math.round(v * k + y[i] * (1 - k)).toString(16).padStart(2, '0')).join('');
+}
 
 class App {
-  constructor({ input = process.stdin, output = process.stdout, folder = process.cwd(), request = '' } = {}) {
+  constructor({ input = process.stdin, output = process.stdout, folder = null, request = '' } = {}) {
     Th.use(AI.config.load().theme || 'walnut');
-    this.ed = new Editor();
-    if (request) this.ed.set(request);
-    this.mode = 'ask'; // ask | folder | privacy | thinking | review | done
-    this.mood = { scene: 'idle', at: Date.now() };
-    this.flash = null;
+    this.ed = new Editor(); // what to ask the AI
+    this.fed = new Editor(); // a folder path you type
+    this.mode = 'pick'; // pick | path | plan | done
+    this.way = 'kind';
+    this.ai = { plan: null, asking: true, thinking: false, step: '', started: 0, done: 0, total: 0, request: '' };
+    this.idea = 0;
     this.sel = 0;
     this.top = 0;
     this.prune = false;
+    this.consent = false;
+    this.calm = 0;
+    this.mood = { scene: 'idle', at: Date.now() };
+    this.flash = null;
     this.ui = new Tui({ input, output, paper: Th.t().paper, render: (w, h) => this.frame(w, h) });
     this.ui.on('key', (s, k) => this.onKey(s || '', k || {}));
-    this.ui.on('paste', (t) => { const ed = this.mode === 'folder' ? this.fed : this.ed; if (ed) ed.insert(t.replace(/\s*\n\s*/g, ' ').trim()); this.dirty(); });
-    this.ui.on('mouse', (m) => { if (m.wheel && this.mode === 'review') { this.move(m.wheel); this.dirty(); } });
-    this.setFolder(folder, true);
+    this.ui.on('paste', (t) => { const ed = this.mode === 'path' ? this.fed : this.typing() ? this.ed : null; if (ed) ed.insert(t.replace(/\s*\n\s*/g, ' ').trim()); this.dirty(); });
+    this.ui.on('mouse', (m) => { if (m.wheel && this.mode === 'plan' && this.plan()) { this.move(m.wheel); this.dirty(); } });
+    this.places = this.candidates();
+    this.pickSel = 0;
+    if (folder) {
+      if (this.open(folder) && request) { this.ed.set(request); this.way = 'ai'; this.autoAsk = true; }
+    }
   }
 
   run() {
@@ -49,7 +92,12 @@ class App {
       this.done = resolve;
       this.ui.start();
       this.ticker = setInterval(() => { if (this.flash && this.flash.until < Date.now()) this.flash = null; this.dirty(); }, 130);
-      AI.current().then(({ model, all }) => { this.model = model; this.models = all; this.dirty(); }, () => {});
+      AI.current().then(({ model, all }) => {
+        this.model = model;
+        this.models = all;
+        if (this.autoAsk) { this.autoAsk = false; this.askAI(); }
+        this.dirty();
+      }, () => {});
     });
   }
 
@@ -63,294 +111,486 @@ class App {
   dirty() { this.ui.schedule(); }
   say(text, kind = 'dim', ms = 4500) { this.flash = { text, kind, until: Date.now() + ms }; this.dirty(); }
   react(scene) { this.mood = { scene, at: Date.now() }; }
+  /** A fresh plan just appeared: ignore Enter for a moment so a double-tap can't move things by accident. */
+  guard() { this.calm = Date.now() + 400; }
+  typing() { return this.mode === 'plan' && this.way === 'ai' && this.ai.asking && !this.ai.thinking; }
 
-  setFolder(dir, quiet) {
+  // ── folders ─────────────────────────────────────────────────────────────────
+  /** Downloads, Desktop, Documents and the folder you're in, if tidy may sort them. */
+  candidates() {
+    const home = os.homedir();
+    const list = [];
+    const add = (label, dir) => {
+      const real = Scan.safeReal(dir);
+      if (!real || !isDir(real) || Scan.refuse(real) || list.some((x) => x.dir === real)) return;
+      let count = 0;
+      try { count = fs.readdirSync(real).filter((n) => !n.startsWith('.')).length; } catch { /* unreadable */ }
+      const last = Run.runs().find((r) => r.root === real && r.moved.length);
+      list.push({ label, dir: real, count, last });
+    };
+    add('This folder', process.cwd());
+    for (const name of ['Downloads', 'Desktop', 'Documents']) add(name, path.join(home, name));
+    if (list[0] && list[0].label === 'This folder' && list.slice(1).some((x) => x.dir === list[0].dir)) list.shift();
+    list.push({ label: 'Somewhere else…', dir: null });
+    return list;
+  }
+
+  open(dir) {
     const why = Scan.refuse(untilde(dir));
-    if (why) { if (!quiet) this.say(why, 'err', 7000); else { this.folder = null; this.folderWhy = why; } return false; }
+    if (why) { this.say(why, 'err', 8000); return false; }
     this.folder = Scan.safeReal(untilde(dir));
-    this.folderWhy = null;
-    try { this.peek = Scan.scan(this.folder); } catch (e) { this.peek = null; }
+    this.refresh();
+    this.mode = 'plan';
+    this.react('idle');
+    this.guard();
     return true;
   }
 
-  // ── the flow ────────────────────────────────────────────────────────────────
-  start() {
-    if (!this.folder) return this.say(this.folderWhy || 'Pick a folder first (Tab).', 'err', 7000);
-    if (!this.model) return this.say('tidy needs an AI: install Ollama (ollama.com) and a model, or set up Tree of Thought first.', 'err', 9000);
-    if (!AI.local(this.model) && this.mode !== 'privacy') { this.mode = 'privacy'; return this.dirty(); }
+  /** Look at the folder again and remake the instant plans. */
+  refresh() {
+    try { this.scanned = Scan.scan(this.folder); } catch { this.scanned = { root: this.folder, items: [], dirs: [], skipped: {}, truncated: false }; }
+    this.plans = { kind: Quick.byKind(this.scanned), date: Quick.byDate(this.scanned) };
+    this.ai.plan = null; // files moved: an older AI plan no longer fits
+    this.ai.asking = true;
+    this.lastHere = Run.runs().find((r) => r.root === this.folder && !r.undone && r.moved.length) || null;
+    this.sel = 0;
+    this.top = 0;
+  }
+
+  plan() { return this.way === 'ai' ? (this.ai.thinking || this.ai.asking ? null : this.ai.plan) : this.plans && this.plans[this.way]; }
+
+  // ── the AI ──────────────────────────────────────────────────────────────────
+  allowed(m) { return AI.local(m) || (AI.config.load().cloudOk || []).includes(m.provider); }
+
+  askAI() {
+    if (!this.model) return this.say('Asking the AI needs one: install Ollama (ollama.com) and a model, or set up Tree of Thought. By kind and By date work without one.', 'err', 10000);
+    if (!this.allowed(this.model)) { this.consent = true; return this.dirty(); }
     this.think();
   }
 
   async think() {
-    this.mode = 'thinking';
+    const ai = this.ai;
+    Object.assign(ai, { thinking: true, asking: false, started: Date.now(), step: 'Reading what is here…', done: 0, total: 0 });
     this.react('think');
-    this.step = 'Looking around…';
     this.dirty();
     this.ac = new AbortController();
+    const request = this.ed.text.trim();
     try {
       const s = Scan.scan(this.folder);
-      if (!s.items.length) throw new Error('There is nothing here to tidy.');
-      this.step = `Designing folders for ${s.items.length} things…`;
-      this.plan = await Plan.makePlan(this.model, s, this.ed.text.trim(), {
+      if (!s.items.length) throw new Error('There is nothing here to sort.');
+      ai.total = s.items.length;
+      const plan = await Plan.makePlan(this.model, s, request, {
         signal: this.ac.signal,
-        onStep: (p) => { this.step = p.step === 'design' ? `Designing folders for ${s.items.length} things…` : `Deciding where things go: ${p.done} of ${p.total}…`; this.dirty(); },
+        onStep: (p) => {
+          ai.step = p.step === 'design' ? 'Designing the folders…' : p.step === 'one' ? `Planning ${plural(s.items.length, 'thing')}…` : 'Deciding where things go…';
+          ai.done = p.done || 0;
+          this.dirty();
+        },
       });
-      this.scanned = s;
-      this.sel = 0;
-      this.top = 0;
-      this.mode = 'review';
-      this.react(this.plan.moves.length ? 'idle' : 'oops');
-      if (!this.plan.moves.length) this.say('Everything already looks like it is where it should be. Try asking for something more specific.', 'warn', 8000);
+      ai.plan = plan;
+      ai.request = request;
+      if (this.way === 'ai') { this.sel = 0; this.top = 0; this.guard(); }
+      this.react(plan.moves.length ? 'idle' : 'oops');
     } catch (e) {
-      this.mode = 'ask';
+      ai.asking = true;
       this.react('oops');
-      if (e.name !== 'AbortError') this.say(e.message, 'err', 9000);
+      if (e.name !== 'AbortError') this.say(e.message, 'err', 10000);
     }
+    ai.thinking = false;
     this.ac = null;
     this.dirty();
   }
 
+  nextModel() {
+    if (!this.models || !this.models.length) return this.say('No AIs found. Install Ollama (ollama.com), or set up Tree of Thought.', 'warn', 7000);
+    const i = this.models.findIndex((m) => this.model && AI.keyOf(m) === AI.keyOf(this.model));
+    this.model = this.models[(i + 1) % this.models.length];
+    AI.choose(this.model);
+    this.say(`The AI is now ${this.model.name}${AI.local(this.model) ? ', on this computer: nothing leaves it' : ''}.`, 'ok');
+  }
+
+  // ── doing it ────────────────────────────────────────────────────────────────
   applyPlan() {
-    const n = this.plan.moves.filter((m) => m.on).length;
-    if (!n) return this.say('Nothing is switched on. Press a to switch everything on.', 'warn');
-    if (!this.armed) { this.armed = true; return this.say(`Press Enter again to move ${n} thing${n === 1 ? '' : 's'}. Nothing is deleted, and u puts it all back.`, 'acorn', 6000); }
-    this.armed = false;
+    const p = this.plan();
+    if (!p || !p.moves.length) return;
+    const n = p.moves.filter((m) => m.on).length;
+    if (!n) return this.say('Every move is switched off. Space switches one back on, a switches them all.', 'warn');
     this.react('work');
-    this.result = Run.apply(this.plan, { prune: this.prune, onMove: () => {} });
+    this.result = Run.apply(p, { prune: this.prune });
+    const where = new Map();
+    for (const m of this.result.moved) { const top = path.posix.dirname(m.to).split('/')[0]; where.set(top, (where.get(top) || 0) + 1); }
+    this.result.where = [...where.entries()].map(([name, n]) => ({ name, n, hue: this.hueOf(p, name) }));
+    this.result.into = where.size;
     this.flash = null;
-    this.setFolder(this.folder, true);
+    try { this.scanned = Scan.scan(this.folder); } catch { /* the header can wait */ }
     this.mode = 'done';
     this.react('done');
     this.dirty();
   }
 
-  undoLast() {
+  undoHere() {
+    const last = this.lastHere || Run.runs().find((r) => r.root === this.folder && !r.undone && r.moved.length);
+    if (!last) return this.say('There is no tidy to undo here.', 'warn');
     try {
-      const r = Run.undo();
-      this.say(`Put back ${r.back.length} thing${r.back.length === 1 ? '' : 's'}${r.stuck.length ? `; ${r.stuck.length} couldn't be (they moved again)` : ''}.`, 'ok', 7000);
+      const r = Run.undo(last.id);
+      this.say(`Put back ${plural(r.back.length, 'thing')}${r.stuck.length ? `; ${r.stuck.length} couldn't be (they moved again)` : ''}.`, 'ok', 7000);
       this.react('idle');
-      if (this.folder) this.setFolder(this.folder, true);
     } catch (e) { this.say(e.message, 'warn'); }
+    this.refresh();
+    this.mode = 'plan';
+    this.guard();
   }
 
-  nextModel() {
-    if (!this.models || !this.models.length) return this.say('No models found. Install Ollama (ollama.com) or set up Tree of Thought.', 'warn', 7000);
-    const i = this.models.findIndex((m) => this.model && AI.keyOf(m) === AI.keyOf(this.model));
-    this.model = this.models[(i + 1) % this.models.length];
-    AI.choose(this.model);
-    this.say(`Using ${this.model.name}${AI.local(this.model) ? ' (on this computer: nothing leaves it)' : ''}.`, 'ok');
+  setWay(id) {
+    this.way = id;
+    this.sel = 0;
+    this.top = 0;
+    if (id === 'ai' && !this.ai.plan && !this.ai.thinking) this.ai.asking = true;
+    this.guard();
+  }
+
+  turn(step) {
+    const i = WAYS.findIndex((w) => w.id === this.way);
+    this.setWay(WAYS[(i + step + WAYS.length) % WAYS.length].id);
   }
 
   move(step) {
-    const n = this.plan ? this.plan.moves.length : 0;
+    const p = this.plan();
+    const n = p ? p.moves.length : 0;
     this.sel = Math.max(0, Math.min(n - 1, this.sel + step));
   }
 
-  // ── keys ──────────────────────────────────────────────────────────────────
+  // ── keys ────────────────────────────────────────────────────────────────────
   onKey(s, k) {
     if (k.ctrl && (k.name === 'c' || k.name === 'd')) return this.quit();
-    const m = this.mode;
-    if (m === 'thinking') { if (k.name === 'escape') { if (this.ac) this.ac.abort(); this.say('Stopped. Nothing was moved.'); } return; }
-    if (m === 'privacy') {
-      if (s === 'y' || k.name === 'return') { this.mode = 'ask'; this.think(); }
-      else if (s === 'm') { this.mode = 'ask'; this.nextModel(); }
-      else if (k.name === 'escape' || s === 'n' || s === 'q') this.mode = 'ask';
+    if (k.ctrl && k.name === 't') { Th.use(Th.name() === 'walnut' ? 'linen' : 'walnut'); AI.config.save({ ...AI.config.load(), theme: Th.name() }); this.ui.setPaper(Th.t().paper); return this.dirty(); }
+    if (this.consent) {
+      if (s === 'y' || k.name === 'return') {
+        const c = AI.config.load();
+        AI.config.save({ ...c, cloudOk: [...new Set([...(c.cloudOk || []), this.model.provider])] });
+        this.consent = false;
+        this.think();
+      } else if (s === 'n' || k.name === 'escape') { this.consent = false; this.say('Nothing was sent. Ctrl+O picks another AI, or use By kind or By date.', 'dim', 7000); }
+      else if (k.ctrl && k.name === 'o') { this.nextModel(); if (this.allowed(this.model)) { this.consent = false; this.think(); } }
       return this.dirty();
     }
-    if (m === 'folder') {
-      if (k.name === 'return') { if (this.setFolder(this.fed.text.trim() || '.')) { this.mode = 'ask'; this.say(`Tidying ${tilde(this.folder)}.`, 'ok'); } }
-      else if (k.name === 'escape') this.mode = 'ask';
+    const m = this.mode;
+    if (m === 'pick') {
+      if (k.name === 'up') this.pickSel = Math.max(0, this.pickSel - 1);
+      else if (k.name === 'down') this.pickSel = Math.min(this.places.length - 1, this.pickSel + 1);
+      else if (k.name === 'return') {
+        const p = this.places[this.pickSel];
+        if (p.dir) this.open(p.dir);
+        else { this.fed.set('~/'); this.mode = 'path'; }
+      } else if (k.name === 'escape' || s === 'q') {
+        if (this.folder) { this.mode = 'plan'; this.guard(); } else return this.quit();
+      }
+      return this.dirty();
+    }
+    if (m === 'path') {
+      if (k.name === 'return') this.open(this.fed.text.trim() || '.');
+      else if (k.name === 'escape') this.mode = 'pick';
       else edit(this.fed, s, k);
       return this.dirty();
     }
-    if (m === 'review') {
-      const mv = this.plan.moves[this.sel];
-      if (k.name === 'up') this.move(-1);
-      else if (k.name === 'down') this.move(1);
-      else if (k.name === 'pageup') this.move(-10);
-      else if (k.name === 'pagedown') this.move(10);
-      else if (s === ' ' && mv) { mv.on = !mv.on; this.armed = false; }
-      else if (s === 'a') { const all = this.plan.moves.every((x) => x.on); this.plan.moves.forEach((x) => { x.on = !all; }); this.armed = false; }
-      else if (s === 'p') { this.prune = !this.prune; this.say(this.prune ? 'Folders this leaves completely empty will be removed (undo brings them back).' : 'Empty folders will be left alone.'); }
-      else if (k.name === 'return') this.applyPlan();
-      else if (s === 'e' || k.name === 'escape') { this.mode = 'ask'; this.armed = false; this.react('idle'); }
-      else if (s === 'q') this.quit();
-      return this.dirty();
-    }
     if (m === 'done') {
-      if (s === 'u') { this.undoLast(); this.mode = 'ask'; }
-      else if (k.name === 'return' || k.name === 'escape') { this.mode = 'ask'; this.ed.clear(); this.react('idle'); this.setFolder(this.folder, true); }
-      else if (s === 'q') this.quit();
+      if (s === 'u') this.undoHere();
+      else if (k.name === 'return' || k.name === 'escape') { this.refresh(); this.mode = 'plan'; this.react('idle'); this.guard(); }
+      else if (s === 'q') return this.quit();
       return this.dirty();
     }
-    // ask
-    const empty = !this.ed.text;
-    if (k.name === 'return') return this.start();
-    if (k.name === 'tab') { this.fed = new Editor(); this.fed.set(this.folder ? tilde(this.folder) : '~/Downloads'); this.mode = 'folder'; return this.dirty(); }
-    if (k.name === 'escape') { if (empty) return this.quit(); this.ed.clear(); return this.dirty(); }
-    if (empty && s === 'q') return this.quit();
+    // the plan screen
+    if (k.name === 'tab') { this.places = this.candidates(); this.pickSel = Math.max(0, this.places.findIndex((x) => x.dir === this.folder)); this.mode = 'pick'; return this.dirty(); }
     if (k.ctrl && k.name === 'o') { this.nextModel(); return this.dirty(); }
-    if (k.ctrl && k.name === 'z') { this.undoLast(); return this.dirty(); }
-    if (k.ctrl && k.name === 't') { Th.use(Th.name() === 'walnut' ? 'linen' : 'walnut'); AI.config.save({ ...AI.config.load(), theme: Th.name() }); this.ui.setPaper(Th.t().paper); return this.dirty(); }
-    edit(this.ed, s, k);
+    if (this.typing()) {
+      const empty = !this.ed.text;
+      if (k.name === 'return') this.askAI();
+      else if (k.name === 'up' || k.name === 'down') { this.idea = Math.max(0, Math.min(IDEAS.length - 1, this.idea + (k.name === 'up' ? -1 : 1))); this.ed.set(IDEAS[this.idea][0]); }
+      else if (empty && (k.name === 'left' || k.name === 'right')) this.turn(k.name === 'left' ? -1 : 1);
+      else if (k.name === 'escape') { if (this.ai.plan) { this.ai.asking = false; this.guard(); } else if (!empty) this.ed.clear(); else this.setWay('kind'); }
+      else if (k.ctrl && k.name === 'z') this.undoHere();
+      else edit(this.ed, s, k);
+      return this.dirty();
+    }
+    if (k.name === 'left' || k.name === 'right') this.turn(k.name === 'left' ? -1 : 1);
+    else if (s >= '1' && s <= '3') this.setWay(WAYS[Number(s) - 1].id);
+    else if (k.name === 'up') this.move(-1);
+    else if (k.name === 'down') this.move(1);
+    else if (k.name === 'pageup') this.move(-10);
+    else if (k.name === 'pagedown') this.move(10);
+    else if (s === ' ') { const mv = this.plan() && this.plan().moves[this.sel]; if (mv) mv.on = !mv.on; }
+    else if (s === 'a') { const p = this.plan(); if (p) { const all = p.moves.every((x) => x.on); p.moves.forEach((x) => { x.on = !all; }); } }
+    else if (s === 'p') { this.prune = !this.prune; this.say(this.prune ? 'Folders this leaves empty will be removed too (undo brings them back).' : 'Empty folders will be left alone.'); }
+    else if (s === 'u') this.undoHere();
+    else if ((s === 'e' || s === '/') && this.way === 'ai' && !this.ai.thinking) { this.ai.asking = true; this.ed.set(this.ai.request); }
+    else if (k.name === 'return') { if (Date.now() >= this.calm) this.applyPlan(); }
+    else if (k.name === 'escape') { if (this.way === 'ai' && this.ai.thinking) { this.ac.abort(); this.say('Stopped. Nothing was moved.'); } else return this.quit(); }
+    else if (s === 'q') return this.quit();
     this.dirty();
   }
 
-  // ── drawing ───────────────────────────────────────────────────────────────
+  // ── drawing ─────────────────────────────────────────────────────────────────
   frame(W, H) {
     const t = Th.t();
     const out = [];
-    const ms = Date.now() - this.mood.at;
-    const bird = Hazel.draw(this.mood.scene, ms, t.paper.bg);
-    const where = this.folder ? tilde(this.folder) : Th.err('no folder yet');
-    const peek = this.peek ? `${this.peek.items.length}${this.peek.truncated ? '+' : ''} things · ${size(this.peek.items.reduce((a, b) => a + b.size, 0))}` : '';
-    const mdl = this.model ? `${this.model.name}${AI.local(this.model) ? Th.moss(' · on this computer') : Th.dim(` · ${(P.PROVIDERS[this.model.provider] || { name: this.model.provider }).name}`)}` : Th.err('no AI yet');
-    const info = [
-      spread(A.paint('tidy', { bold: true, fg: t.acorn }) + Th.dim('  ·  an AI that tidies folders, carefully'), Th.dim(`v${pkg.version}`), W - 24),
-      '',
-      Th.dim('folder  ') + where + (peek ? Th.faint('  ·  ' + peek) : ''),
-      Th.dim('AI      ') + mdl,
-      '',
-      Th.faint('never deletes · never replaces · stays in this folder · u undoes'),
-    ];
-    for (let i = 0; i < 8; i++) out.push(' ' + bird[i] + '  ' + (info[i - 1] || ''));
+    // the top line: where you are
+    const sc = this.scanned;
+    const facts = this.folder && sc ? `${plural(sc.items.length, 'thing')}${sc.truncated ? '+' : ''} · ${size(sc.items.reduce((a, b) => a + b.size, 0))}` : '';
+    const left = ' ' + A.paint('tidy', { bold: true, fg: t.acorn }) + (this.folder && this.mode !== 'pick' && this.mode !== 'path'
+      ? '   ' + A.paint(path.basename(this.folder), { bold: true }) + Th.dim('  ' + tilde(this.folder)) + Th.faint('  ·  ' + facts)
+      : Th.dim('   sorts a folder for you, carefully'));
+    out.push(spread(left, Th.faint(pkg.version + ' '), W));
     out.push(Th.faint('─'.repeat(W)));
-    const bodyH = H - out.length - 3;
-    let body = [];
-    let cursor = null;
-    if (this.mode === 'review') body = this.reviewLines(W, bodyH);
+    const bodyH = Math.max(4, H - out.length - 3);
+    let body;
+    if (this.mode === 'pick' || this.mode === 'path') body = this.pickLines(W, bodyH);
     else if (this.mode === 'done') body = this.doneLines(W, bodyH);
-    else if (this.mode === 'thinking') body = ['', '  ' + A.paint(this.step || 'Thinking…', { fg: t.acorn }), '', '  ' + Th.dim(`${this.model ? this.model.name : 'The AI'} is reading what's here. Nothing moves until you say so.`), '  ' + Th.faint('esc stops')];
-    else if (this.mode === 'privacy') body = this.privacyLines(W);
-    else body = this.askLines(W, bodyH);
-    while (body.length < bodyH) body.push('');
-    out.push(...body.slice(0, bodyH));
+    else body = this.planLines(W, bodyH);
+    let cursor = null;
+    if (body.cursor) cursor = { row: out.length + body.cursor.row, col: body.cursor.col };
+    const lines = body.lines || body;
+    while (lines.length < bodyH) lines.push('');
+    out.push(...lines.slice(0, bodyH).map((l) => A.clip(l, W)));
     out.push(Th.faint('─'.repeat(W)));
-    // the line you type on
-    if (this.mode === 'folder') {
-      const label = 'Folder to tidy: ';
+    // the status line: a message, a question, the folder you're typing, or the promises
+    const f = this.flash;
+    if (this.consent) {
+      const who = (P.PROVIDERS[this.model.provider] || { name: this.model.provider }).name;
+      const ask = `${this.model.name} runs on ${who}, not this computer. Let it see file names and short snippets from now on?`;
+      out.push(' ' + A.clip(Th.warn(A.vwidth(ask) <= W - 2 ? ask : `Let ${who} see file names and short snippets?`), W - 2));
+    } else if (this.mode === 'path') {
+      const label = 'Folder to sort: ';
       const lay = this.fed.layout(Math.max(10, W - label.length - 3), 1);
       out.push(' ' + Th.acorn(label, { bold: true }) + lay.lines[0]);
       cursor = { row: out.length - 1, col: 1 + label.length + lay.col };
-    } else if (this.mode === 'ask') {
-      const label = this.folder ? `How should I tidy ${path.basename(this.folder)}? ` : 'Press Tab to pick a folder ';
-      const lay = this.ed.layout(Math.max(10, W - A.vwidth(label) - 5), 1);
-      out.push(' ' + Th.acorn(label, { bold: true }) + Th.acorn('› ') + (this.ed.text ? lay.lines[0] : Th.faint('say what you want, or just press Enter')));
-      cursor = { row: out.length - 1, col: 1 + A.vwidth(label) + 2 + lay.col };
-    } else out.push('');
-    const hints = {
-      ask: 'enter make a plan · tab another folder · ctrl+o change AI · ctrl+z undo last tidy · ctrl+t colours · esc quit',
-      folder: 'enter use this folder · esc cancel',
-      privacy: 'y continue · m use another AI · esc cancel',
-      thinking: 'esc stop',
-      review: '↑↓ look · space skip/keep · a all · p also remove emptied folders · enter move · e change request',
-      done: 'u put it all back · enter tidy again · q quit',
-    };
-    const f = this.flash;
-    out.push(' ' + A.clip(f ? A.paint(f.text, { fg: t[f.kind] || t.dim }) : Th.faint(hints[this.mode]), W - 2));
+    } else if (f) out.push(' ' + A.clip(A.paint(f.text, { fg: t[f.kind] || t.dim }), W - 2));
+    else out.push(' ' + Th.faint(W >= 90 ? 'only moves things into folders  ·  never deletes or replaces anything  ·  u undoes' : 'only moves things  ·  never deletes or replaces  ·  u undoes'));
+    out.push(this.keyBar(W));
     return { lines: out.slice(0, H), cursor };
   }
 
-  askLines(W) {
-    const out = [''];
-    if (!this.folder) out.push('  ' + Th.err(this.folderWhy || 'Pick a folder to tidy.'), '');
-    out.push('  ' + Th.bold('Tell tidy what you want, in your own words. For example:'));
-    for (const ex of ['sort these by school subject, and put installers in one place', 'organise my photos by year and month', 'group these by project, and keep the folders I already made', 'just clean it up']) out.push('    ' + Th.dim('· ') + Th.cream(ex));
-    out.push('');
-    out.push('  ' + Th.bold('How tidy stays safe'));
-    const safe = [
-      ['plans first', 'nothing moves until you have seen every move and pressed Enter twice'],
-      ['only moves', 'never deletes, never renames, never replaces a file'],
-      ['stays inside', `only touches ${this.folder ? path.basename(this.folder) : 'the folder you pick'}, never system folders or your whole home`],
-      ['keeps whole', 'projects (with .git, package.json…), apps and hidden files are left as they are'],
-      ['keeps private', 'passwords, keys and tax-looking files are never read; other files only as a short snippet'],
-      ['undo', 'every move is written down first: u (or tidy undo) puts everything back'],
-    ];
-    for (const [k, d] of safe) out.push('    ' + Th.moss(k.padEnd(14)) + Th.dim(d));
-    const last = Run.runs().slice(0, 3);
-    if (last.length) {
-      out.push('', '  ' + Th.bold('Recent tidies'));
-      for (const r of last) out.push('    ' + Th.faint(ago(r.started).padEnd(9)) + fit(tilde(r.root), 28) + Th.dim(`  ${r.moved.length} moved`) + (r.undone ? Th.faint('  · undone') : '') + Th.faint(r.request ? `  · "${A.clip(r.request, 30)}"` : ''));
-    }
-    return out;
-  }
-
-  privacyLines(W) {
-    const items = this.peek ? this.peek.items : [];
-    const snippets = items.filter((i) => i.hint).length;
-    const priv = items.filter((i) => i.private).length;
-    const who = (P.PROVIDERS[this.model.provider] || { name: this.model.provider }).name;
-    const para = (text, paint) => wrap(text, W - 4).map((l) => '  ' + paint(l));
-    return ['',
-      '  ' + A.paint(`${this.model.name} runs on ${who}'s computers, not yours.`, { bold: true }),
-      '',
-      ...para(`To plan, tidy sends it the names of ${items.length} things with their sizes and dates, and ${snippets} short snippet${snippets === 1 ? '' : 's'} of text (a few lines each, with anything that looks like a password or key blanked out).${priv ? ` ${priv} private-looking file${priv === 1 ? '' : 's'}: the name only.` : ''}`, Th.dim),
-      '',
-      ...para('Want nothing to leave this computer? Use a model from Ollama (press m to switch).', Th.cream),
-      '',
-      '  ' + Th.acorn('Continue? ') + Th.dim('y yes · m another AI · esc no'),
-    ];
-  }
-
-  reviewLines(W, h) {
-    const p = this.plan;
+  /** The keys that do something right now; the main one stands out. */
+  keyBar(W) {
     const t = Th.t();
-    const on = p.moves.filter((m) => m.on).length;
+    const p = this.mode === 'plan' ? this.plan() : null;
+    const on = p ? p.moves.filter((m) => m.on).length : 0;
+    let keys;
+    if (this.consent) keys = [['y', 'allow', true], ['n', 'not now'], ['ctrl+o', 'another AI']];
+    else if (this.mode === 'pick') keys = [['enter', 'open', true], ['↑↓', 'choose'], ['esc', this.folder ? 'back' : 'quit']];
+    else if (this.mode === 'path') keys = [['enter', 'open', true], ['esc', 'back']];
+    else if (this.mode === 'done') keys = [['u', 'put it all back', true], ['enter', 'keep going'], ['q', 'quit']];
+    else if (this.typing()) keys = [['enter', 'ask the AI', true], ['↑↓', 'pick an idea'], ['ctrl+o', 'another AI'], ['esc', this.ai.plan ? 'back to the plan' : 'back']];
+    else if (this.way === 'ai' && this.ai.thinking) keys = [['esc', 'stop'], ['←→', 'look at another way']];
+    else {
+      keys = [];
+      if (on) keys.push(['enter', `move ${plural(on, 'thing')}`, true]);
+      keys.push(['←→', 'another way']);
+      if (p && p.moves.length) keys.push(['space', 'skip']);
+      if (this.way === 'ai') keys.push(['e', 'ask differently']);
+      if (this.lastHere) keys.push(['u', 'undo last tidy']);
+      keys.push(['tab', 'other folder'], ['esc', 'quit']);
+    }
+    const chip = ([key, label, main]) => (main
+      ? A.paint(` ${key} `, { bg: t.acorn, fg: t.paper.bg, bold: true }) + ' ' + A.paint(label, { fg: t.cream, bold: true })
+      : A.paint(key, { fg: t.cream }) + ' ' + Th.dim(label));
+    let parts = keys.map(chip);
+    while (parts.length > 1 && A.vwidth(' ' + parts.join('   ')) > W) parts = parts.slice(0, -1);
+    return ' ' + parts.join('   ');
+  }
+
+  /** Hazel on the left, words on the right. */
+  beside(scene, lines, W) {
+    const pic = Hazel.draw(scene, Date.now() - this.mood.at, Th.t().paper.bg);
+    const hw = Hazel.WIDTH;
     const out = [];
-    out.push(' ' + A.paint(`${on} of ${p.moves.length} moves into ${p.folders.length} folders`, { bold: true }) + Th.dim('  ·  nothing deleted, nothing replaced') + (this.prune ? Th.acorn('  ·  emptied folders removed') : ''));
-    if (p.summary) out.push(' ' + Th.dim(A.clip(p.summary, W - 2)));
-    const dropped = Object.values(p.dropped).reduce((a, b) => a + b, 0);
-    if (dropped) out.push(' ' + Th.faint(`(${dropped} of the AI's suggestions didn't pass tidy's checks and were left out)`));
+    for (let i = 0; i < Math.max(pic.length, lines.length); i++) out.push('  ' + (pic[i] || ' '.repeat(hw)) + '    ' + (lines[i] || ''));
+    return { lines: out, col: 2 + hw + 4 };
+  }
+
+  pickLines(W) {
+    const t = Th.t();
+    const right = [A.paint('Which folder should tidy sort?', { bold: true }), ''];
+    const nameW = Math.max(...this.places.map((p) => A.vwidth(p.label))) + 3;
+    this.places.forEach((p, i) => {
+      const cur = i === this.pickSel;
+      const mark = cur ? Th.acorn('› ') : '  ';
+      const name = A.paint(p.label.padEnd(nameW), cur ? { bold: true, fg: t.acorn } : { fg: t.cream });
+      let info = '';
+      if (p.dir) info = (p.count ? Th.dim(plural(p.count, 'thing').padStart(11)) : Th.faint('empty'.padStart(11))) + (p.label === 'This folder' ? Th.faint('  ' + tilde(p.dir)) : '') + (p.last ? Th.faint(`   tidied ${ago(p.last.started)}`) : '');
+      else info = Th.faint('type where it is');
+      right.push(mark + name + info);
+    });
+    right.push('', Th.dim('You see the whole plan before anything moves.'));
+    return this.beside(this.mood.scene, right, W).lines;
+  }
+
+  planLines(W, H) {
+    const t = Th.t();
+    const out = [];
+    const p = this.plan();
+    // the ways, as tabs
+    const tabs = WAYS.map((w) => {
+      const on = w.id === this.way;
+      const hue = t[w.hue];
+      let label = w.name;
+      if (w.id === 'ai' && this.ai.thinking) label += ' ' + SPIN[Math.floor(Date.now() / 160) % SPIN.length];
+      else if (w.id === 'ai' && this.ai.plan && !on) label += ' •';
+      return on ? A.paint(` ${label} `, { bg: mix(hue, t.paper.bg, 0.22), fg: hue, bold: true }) : A.paint(` ${label} `, { fg: t.dim });
+    }).join(' ');
+    let summary = '';
+    if (p) {
+      const on = p.moves.filter((m) => m.on).length;
+      summary = p.moves.length ? Th.cream(`${on === p.moves.length ? plural(on, 'move') : `${on} of ${plural(p.moves.length, 'move')}`} into ${plural(p.folders.length, 'folder')}`) : '';
+    }
+    out.push(spread(' ' + tabs, summary + ' ', W));
+    if (this.way === 'ai' && this.ai.thinking) return out.concat([''], this.thinkingLines(W).lines);
+    if (this.typing()) {
+      const a = this.askLines(W);
+      return { lines: out.concat([''], a.lines), cursor: a.cursor && { row: a.cursor.row + 2, col: a.cursor.col } };
+    }
+    if (!p) return out;
+    if (!p.moves.length) return out.concat([''], this.emptyLines(p, W));
+    out.push(' ' + Th.dim(A.clip(p.summary || '', W - 2)));
+    const dropped = Object.values(p.dropped || {}).reduce((a, b) => a + b, 0);
+    if (dropped && p.how === 'ai') out.push(' ' + Th.faint(`${plural(dropped, 'suggestion')} from the AI didn't pass tidy's safety checks and ${dropped === 1 ? 'was' : 'were'} left out.`));
     out.push('');
-    // new folders on the left, the moves on the right (or stacked when narrow)
-    const tree = Plan.treeOf(p).map((x) => '  '.repeat(x.depth) + Th.acorn(x.name) + Th.faint(` ${x.count}`));
-    const wide = W >= 100;
-    const leftW = wide ? Math.min(34, Math.max(...tree.map((x) => A.vwidth(x)), 12) + 2) : 0;
-    const rows = h - out.length;
+    return out.concat(this.moveLines(p, W, H - out.length));
+  }
+
+  /** Each top-level folder of a plan gets its own colour. */
+  hueOf(p, dest) {
+    if (!p._hues) {
+      p._hues = new Map();
+      for (const f of p.folders) { const top = f.path.split('/')[0].toLowerCase(); if (!p._hues.has(top)) p._hues.set(top, Th.t()[HUES[p._hues.size % HUES.length]]); }
+    }
+    const top = dest.split('/')[0].toLowerCase();
+    if (!p._hues.has(top)) p._hues.set(top, Th.t()[HUES[p._hues.size % HUES.length]]);
+    return p._hues.get(top);
+  }
+
+  moveLines(p, W, rows) {
+    const t = Th.t();
+    const tree = Plan.treeOf(p);
+    const wide = W >= 96 && tree.length;
+    const out = [];
+    let leftW = 0;
+    const left = [];
+    if (wide) {
+      let parent = '';
+      for (const x of tree) {
+        const top = x.depth === 0;
+        if (top) parent = x.name;
+        const name = '  '.repeat(Math.max(0, x.depth - 1)) + (top ? '' : Th.faint('└ ')) + A.paint(x.name, { fg: this.hueOf(p, parent), bold: top });
+        left.push({ name, count: x.count });
+      }
+      leftW = Math.min(36, Math.max(...left.map((x) => A.vwidth(x.name) + String(x.count).length + 3), 14)) + 2;
+    } else if (tree.length) {
+      // narrow: the folders on one line
+      const chips = tree.filter((x) => x.depth === 0).map((x) => A.paint(x.name, { fg: this.hueOf(p, x.name), bold: true }) + Th.faint(' ' + x.count));
+      out.push(' ' + A.clip(chips.join('   '), W - 2));
+      out.push('');
+      rows -= 2;
+    }
+    const over = p.moves.length + 1 > rows; // +1: the reason under the chosen move
+    if (over) rows -= 1; // room to say where you are in the list
     if (this.sel < this.top) this.top = this.sel;
-    if (this.sel >= this.top + rows) this.top = this.sel - rows + 1;
+    if (this.sel >= this.top + rows - 1) this.top = Math.max(0, this.sel - rows + 2);
+    const listW = W - leftW - 2;
+    const toW = Math.min(30, Math.max(12, Math.floor(listW * 0.36)));
+    const nameW = Math.max(10, listW - toW - 6);
     const right = [];
-    const nameW = Math.max(12, Math.floor((W - leftW - 10) * 0.42));
-    const toW = Math.max(10, W - leftW - nameW - 14);
     for (let i = this.top; i < p.moves.length && right.length < rows; i++) {
       const m = p.moves[i];
       const cur = i === this.sel;
-      const box = m.on ? Th.moss('[x]') : Th.faint('[ ]');
+      const dest = path.posix.dirname(m.to);
+      const hue = this.hueOf(p, dest);
+      const dot = m.on ? A.paint('●', { fg: hue }) : Th.faint('○');
       const name = A.paint(fit(m.from + (m.isDir ? '/' : ''), nameW), m.on ? (cur ? { bold: true } : {}) : { fg: t.faint });
-      const to = A.paint(fit('→ ' + path.posix.dirname(m.to) + '/', toW), { fg: m.on ? t.sky : t.faint });
-      right.push((cur ? Th.acorn('›') : ' ') + box + ' ' + name + ' ' + to);
-      if (cur && m.why && right.length < rows) right.push('      ' + Th.dim(A.clip(`"${m.why}"`, W - leftW - 8)));
+      const to = m.on ? A.paint(fit('→ ' + dest + '/', toW), { fg: hue }) : Th.faint(fit('stays here', toW));
+      right.push((cur ? Th.acorn('›') : ' ') + ' ' + dot + ' ' + name + ' ' + to);
+      if (cur && m.why && right.length < rows) right.push('     ' + Th.dim(A.clip(m.why, listW - 6)));
     }
-    for (let i = 0; i < rows; i++) {
-      const l = wide ? fit(' ' + (tree[i] || ''), leftW) : '';
+    const shownTo = this.top + right.filter((l) => !l.startsWith('     ')).length;
+    for (let i = 0; i < Math.max(rows, 0); i++) {
+      const l = wide ? (left[i] ? fit(' ' + spread(left[i].name, Th.faint(String(left[i].count)), leftW - 3), leftW) : ' '.repeat(leftW)) : '';
       out.push(l + (right[i] || ''));
     }
-    return out;
-  }
-
-  doneLines() {
-    const r = this.result;
-    const out = ['', '  ' + A.paint(`Moved ${r.moved.length} thing${r.moved.length === 1 ? '' : 's'}${r.made.length ? ` into ${r.made.length} new folder${r.made.length === 1 ? '' : 's'}` : ''}.`, { bold: true, fg: Th.t().ok })];
-    if (r.pruned.length) out.push('  ' + Th.dim(`Removed ${r.pruned.length} folder${r.pruned.length === 1 ? '' : 's'} it left empty.`));
-    if (r.skipped.length) {
-      out.push('', '  ' + Th.warn(`Left ${r.skipped.length} where ${r.skipped.length === 1 ? 'it was' : 'they were'}:`));
-      for (const s of r.skipped.slice(0, 6)) out.push('    ' + Th.dim(`${s.from}: ${s.why}`));
+    if (over) {
+      const extra = left.length > rows ? Th.faint(`  (+${left.length - rows} more folders)`) : '';
+      out.push((wide ? ' '.repeat(leftW) : '') + '  ' + Th.faint(`${this.top + 1}–${shownTo} of ${p.moves.length}  ·  ↑↓ to look through them`) + extra);
     }
-    out.push('', '  ' + Th.cream('Changed your mind? Press u (or run tidy undo later) and everything goes back.'));
-    out.push('  ' + Th.faint(`The record of this tidy: ${tilde(path.join(AI.home(), 'runs', r.id + '.json'))}`));
     return out;
   }
-}
 
-/** Plain text broken into lines at most w wide, at spaces. */
-function wrap(text, w) {
-  const out = [];
-  let line = '';
-  for (const word of String(text).split(/\s+/)) {
-    if (line && A.vwidth(line + ' ' + word) > w) { out.push(line); line = word; } else line = line ? line + ' ' + word : word;
+  emptyLines(p, W) {
+    const w = Math.max(20, W - Hazel.WIDTH - 10);
+    const para = (text, paint) => A.wrap(text, w).map((l) => paint(l));
+    const lines = [];
+    if (this.scanned && !this.scanned.items.length) lines.push(A.paint(`${path.basename(this.folder)} is empty.`, { bold: true }), '', ...para('There is nothing here to sort. Press Tab to pick another folder.', Th.dim));
+    else if (p.how === 'kind') lines.push(A.paint('Nothing to sort by kind.', { bold: true }), '', ...para('The loose files here are already in folders, or there is only one of each kind.', Th.dim));
+    else if (p.how === 'date') lines.push(A.paint('Nothing to sort by date.', { bold: true }), '', ...para(p.summary, Th.dim));
+    else lines.push(A.paint('The AI thinks everything is where it belongs.', { bold: true }), '', ...para('Press e and say more about what you want.', Th.dim));
+    if (this.scanned && this.scanned.items.length) lines.push('', ...para(p.how === 'ai' ? 'Use ←→ to see the other ways.' : 'Use ←→ to see the other ways, or ask the AI for something smarter.', Th.cream));
+    return this.beside('oops', lines, W).lines;
   }
-  if (line) out.push(line);
-  return out;
+
+  askLines(W) {
+    const t = Th.t();
+    const m = this.model;
+    const name = this.folder ? path.basename(this.folder) : 'this folder';
+    const right = [A.paint(`How should the AI sort ${name}?`, { bold: true }), ''];
+    const boxW = Math.max(20, Math.min(64, W - Hazel.WIDTH - 12));
+    const lay = this.ed.layout(boxW - 4, 1);
+    const edge = { fg: t.berry };
+    right.push(A.paint('╭' + '─'.repeat(boxW - 2) + '╮', edge));
+    right.push(A.paint('│ ', edge) + fit(this.ed.text ? lay.lines[0] : Th.faint('say it in your own words, or pick an idea'), boxW - 4) + A.paint(' │', edge));
+    right.push(A.paint('╰' + '─'.repeat(boxW - 2) + '╯', edge));
+    const cursorRow = 3;
+    right.push('');
+    IDEAS.forEach(([ask, label], i) => {
+      const cur = this.ed.text === ask && (ask || i === this.idea);
+      right.push((cur ? Th.berry('› ') : '  ') + A.paint(label, cur ? { fg: t.cream, bold: true } : { fg: t.dim }));
+    });
+    right.push('');
+    const wrapW = Math.max(20, W - Hazel.WIDTH - 8);
+    if (!m) right.push(...A.wrap('No AI found yet. Install Ollama (ollama.com), or set up Tree of Thought.', wrapW).map((l) => Th.err(l)));
+    else if (AI.local(m)) right.push(...A.wrap(`${m.name} runs on this computer, so nothing leaves it.`, wrapW).map((l) => Th.moss(l)));
+    else right.push(...A.wrap(`${m.name} on ${(P.PROVIDERS[m.provider] || { name: m.provider }).name}. It sees file names and short snippets, never private-looking files.`, wrapW).map((l) => Th.dim(l)));
+    const b = this.beside('idle', right, W);
+    return { lines: b.lines, cursor: { row: cursorRow, col: b.col + 2 + lay.col } };
+  }
+
+  thinkingLines(W) {
+    const ai = this.ai;
+    const secs = Math.floor((Date.now() - ai.started) / 1000);
+    const right = [A.paint(ai.step, { bold: true, fg: Th.t().berry }), ''];
+    if (ai.total && ai.done) right.push(Th.berry(bar(ai.done / ai.total, 24, '━', '─')) + Th.dim(`  ${ai.done} of ${ai.total}`), '');
+    right.push(Th.dim(`${this.model ? this.model.name : 'The AI'} is reading the names.  ${secs}s`));
+    right.push(Th.dim('Nothing moves until you see the plan and press Enter.'));
+    right.push('', Th.faint('By kind and By date are ready now, if you want to look (←→).'));
+    return this.beside('think', right, W);
+  }
+
+  doneLines(W) {
+    const r = this.result;
+    const t = Th.t();
+    const right = [A.paint(`Moved ${plural(r.moved.length, 'thing')}${r.into ? ` into ${plural(r.into, 'folder')}` : ''}.`, { bold: true, fg: t.ok })];
+    if (r.where.length) {
+      right.push('');
+      const chips = r.where.map((x) => A.paint(x.name + '/', { fg: x.hue, bold: true }) + Th.faint(' ' + x.n));
+      let line = '';
+      for (const c of chips) { if (line && A.vwidth(line + '   ' + c) > W - Hazel.WIDTH - 10) { right.push(line); line = c; } else line = line ? line + '   ' + c : c; }
+      if (line) right.push(line);
+    }
+    if (r.pruned.length) right.push('', Th.dim(`Removed ${plural(r.pruned.length, 'folder')} it left empty.`));
+    if (r.skipped.length) {
+      right.push('', Th.warn(`Left ${r.skipped.length} where ${r.skipped.length === 1 ? 'it was' : 'they were'}:`));
+      for (const s of r.skipped.slice(0, 4)) right.push(Th.dim(`  ${A.clip(s.from, 40)}: ${s.why}`));
+    }
+    right.push('', Th.cream('Changed your mind? Press u and everything goes back where it was.'));
+    right.push(Th.faint(`You can also undo it later with: tidy undo`));
+    return this.beside(this.mood.scene, right, W).lines;
+  }
 }
 
 function edit(ed, s, k) {
@@ -373,4 +613,4 @@ function edit(ed, s, k) {
   }
 }
 
-module.exports = { App };
+module.exports = { App, IDEAS, WAYS };

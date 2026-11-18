@@ -8,11 +8,13 @@ const THEMES = {
     paper: { bg: '#17130f', fg: '#efe5d6' },
     dim: '#9b8b78', faint: '#5d4f41', line: '#3a2f25', select: '#251e17',
     acorn: '#e8913a', moss: '#9bbf6a', sky: '#7fb3d5', berry: '#e0607a', cream: '#f3e0c2', ok: '#9bbf6a', warn: '#f2c14e', err: '#ff6b5b',
+    plum: '#b993d6', teal: '#5fc4b0', clay: '#d98c6a',
   },
   linen: {
     paper: { bg: '#f6f1e8', fg: '#2a2018' },
     dim: '#7a6a58', faint: '#b9aa96', line: '#e2d8c8', select: '#ece3d5',
     acorn: '#b9601a', moss: '#4f7a2a', sky: '#2f6f9a', berry: '#b8324f', cream: '#8a6a3a', ok: '#3f7a2a', warn: '#9a6a06', err: '#c0392b',
+    plum: '#7a4a9a', teal: '#1f7a6a', clay: '#a5502e',
   },
 };
 let current = THEMES.walnut;

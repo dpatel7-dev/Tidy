@@ -47,16 +47,25 @@ async function design(model, s, request, { signal } = {}) {
 async function assign(model, s, design_, request, { signal, onBatch = () => {} } = {}) {
   const list = design_.folders.map((f) => `- ${f.path}: ${f.for}`).join('\n');
   const system = `You are tidy, a careful assistant that organises a folder. The folders below were chosen; now decide where items go.\n\n${RULES}\n\nAnswer with JSON: {"moves": [{"i": <item number>, "to": "<one of the folders, exactly as written>", "why": "a few words"}]}. Leave out items that should stay where they are.`;
-  const moves = [];
   const items = s.items;
-  for (let at = 0; at < items.length; at += BATCH) {
-    const batch = items.slice(at, at + BATCH);
-    const user = `What the person wants: ${request || 'tidy it up sensibly'}\n\nFolders:\n${list}\n\nItems (number. path | kind size | date | what it says):\n${batch.map(line).join('\n')}`;
-    const j = await AI.askJson(model, system, user, { signal });
-    for (const m of Array.isArray(j.moves) ? j.moves : []) moves.push(m);
-    onBatch(Math.min(items.length, at + BATCH), items.length);
-  }
-  return moves;
+  const batches = [];
+  for (let at = 0; at < items.length; at += BATCH) batches.push(items.slice(at, at + BATCH));
+  // a few batches at a time: much quicker than one after another
+  const results = new Array(batches.length);
+  let next = 0;
+  let done = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const k = next++;
+      const user = `What the person wants: ${request || 'tidy it up sensibly'}\n\nFolders:\n${list}\n\nItems (number. path | kind size | date | what it says):\n${batches[k].map(line).join('\n')}`;
+      const j = await AI.askJson(model, system, user, { signal });
+      results[k] = Array.isArray(j.moves) ? j.moves : [];
+      done += batches[k].length;
+      onBatch(done, items.length);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, batches.length) }, worker));
+  return results.flat();
 }
 
 /** A folder path the AI wrote, made safe, or null. */
@@ -109,17 +118,45 @@ function validate(s, design_, raw) {
     used.add(it.i);
     out.push({ i: it.i, from, to, why: String((m && m.why) || '').slice(0, 120), isDir: it.isDir, size: it.size, mtime: it.mtime, kind: it.kind, on: true });
   }
+  // grouped by where they're going, like the folders shown beside them
+  out.sort((a, b) => a.to.toLowerCase().localeCompare(b.to.toLowerCase()));
   return { moves: out, dropped };
 }
 
+/** Small folders: the folders and the moves in one question, so it's quick. */
+async function oneGo(model, s, request, { signal } = {}) {
+  const ov = overview(s);
+  const system = `You are tidy, a careful assistant that organises a folder on someone's computer. Plan the whole tidy in one go: design the folders, then say where each item goes. The person reviews it before anything moves.\n\n${RULES}\n\nAnswer with JSON: {"summary": "one sentence about the plan", "folders": [{"path": "Folder/Sub", "for": "what goes here"}], "moves": [{"i": <item number>, "to": "<one of your folders, exactly as written>", "why": "a few words"}]}. Leave out items that should stay where they are.`;
+  const user = `The folder: ${path.basename(s.root)}\nWhat the person wants: ${request || 'tidy it up sensibly'}\nExisting folders: ${ov.folders.join(', ') || '(none)'}\n\nItems (number. path | kind size | date | what it says):\n${s.items.map(line).join('\n')}\n\nUse at most ${MAX_FOLDERS} folders. Reuse existing folders where they fit.`;
+  const j = await AI.askJson(model, system, user, { signal });
+  const folders = [];
+  for (const f of Array.isArray(j.folders) ? j.folders : []) {
+    const p = cleanFolder(typeof f === 'string' ? f : f && f.path);
+    if (p && !folders.some((x) => x.path.toLowerCase() === p.toLowerCase())) folders.push({ path: p, for: String((f && f.for) || '').slice(0, 160) });
+    if (folders.length >= MAX_FOLDERS) break;
+  }
+  if (!folders.length) throw new Error("The AI didn't suggest any folders. Try saying a bit more about what you want.");
+  return { design: { summary: String(j.summary || '').slice(0, 300), folders }, raw: Array.isArray(j.moves) ? j.moves : [] };
+}
+
+/** Up to this many items are planned with a single question. */
+const ONE_GO = 150;
+
 /** The whole thing: design, assign, check. onStep({ step, done, total }). */
-async function makePlan(model, s, request, { signal, onStep = () => {} } = {}) {
-  onStep({ step: 'design' });
-  const d = await design(model, s, request, { signal });
-  onStep({ step: 'assign', done: 0, total: s.items.length });
-  const raw = await assign(model, s, d, request, { signal, onBatch: (done, total) => onStep({ step: 'assign', done, total }) });
+async function makePlan(model, s, request, { signal, onStep = () => {}, oneGoUpTo = ONE_GO } = {}) {
+  let d;
+  let raw;
+  if (s.items.length <= oneGoUpTo) {
+    onStep({ step: 'one', done: 0, total: s.items.length });
+    ({ design: d, raw } = await oneGo(model, s, request, { signal }));
+  } else {
+    onStep({ step: 'design' });
+    d = await design(model, s, request, { signal });
+    onStep({ step: 'assign', done: 0, total: s.items.length });
+    raw = await assign(model, s, d, request, { signal, onBatch: (done, total) => onStep({ step: 'assign', done, total }) });
+  }
   const { moves, dropped } = validate(s, d, raw);
-  return { root: s.root, request, model: AI.keyOf(model), made: Date.now(), summary: d.summary, folders: d.folders, moves, dropped, items: s.items.length };
+  return { root: s.root, request, how: 'ai', model: AI.keyOf(model), made: Date.now(), summary: d.summary, folders: d.folders, moves, dropped, items: s.items.length };
 }
 
 /** Before → after, as a little tree of the new folders. */
@@ -143,4 +180,4 @@ function treeOf(plan) {
   return lines;
 }
 
-module.exports = { makePlan, design, assign, validate, cleanFolder, treeOf, RULES };
+module.exports = { makePlan, design, assign, oneGo, validate, cleanFolder, treeOf, RULES, ONE_GO };

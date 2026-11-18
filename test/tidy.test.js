@@ -117,7 +117,8 @@ test("a misbehaving AI can't make tidy do anything unsafe", async () => {
   try {
     const dir = messy('nasty');
     const { model } = await AI.current();
-    const plan = await Plan.makePlan(model, Scan.scan(dir), '', {});
+    for (const oneGoUpTo of [1000, 0]) { // planned in one question, and in batches
+    const plan = await Plan.makePlan(model, Scan.scan(dir), '', { oneGoUpTo });
     for (const m of plan.moves) {
       assert.ok(!m.to.includes('..') && !path.isAbsolute(m.to) && !m.to.startsWith('.'), `unsafe destination ${m.to}`);
       assert.ok(!/Not\/Designed|DELETE|Escape/.test(m.to), `undesigned destination ${m.to}`);
@@ -126,6 +127,7 @@ test("a misbehaving AI can't make tidy do anything unsafe", async () => {
     assert.ok(plan.dropped.unknown >= 1 && plan.dropped.folder >= 2, JSON.stringify(plan.dropped));
     const froms = plan.moves.map((m) => m.from);
     assert.strictEqual(new Set(froms).size, froms.length, 'each thing moves at most once');
+    }
   } finally { await fake.close(); delete process.env.TOT_URL_OLLAMA; }
 });
 
@@ -169,23 +171,86 @@ test("apply skips anything that changed since tidy looked", () => {
   assert.ok(fs.existsSync(path.join(dir, 'holiday.jpg')));
 });
 
-test('the screen draws without the ▀ glyph and shows the safety promises', () => {
+test('instant plans: by kind and by date, no AI, only loose files', () => {
+  const Quick = require('../src/quick');
+  const dir = path.join(tmp, 'quick');
+  const put = (rel, text = 'x', when) => { const f = path.join(dir, rel); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text); if (when) fs.utimesSync(f, when, when); };
+  put('Screenshot 2026-11-01 at 09.12.png');
+  put('Screen Shot 2025-02-03.png');
+  put('cat.jpg');
+  put('dog.heic');
+  put('setup.dmg');
+  put('other-setup.pkg');
+  put('lonely.pdf');
+  put('essay.docx');
+  put('story.docx');
+  put('weird.thing');
+  put('Pictures/old.jpg'); // a folder you made: kept, and reused
+  put('School/notes.txt'); // inside a folder: never touched
+  const s = Scan.scan(dir);
+  const k = Quick.byKind(s);
+  const to = Object.fromEntries(k.moves.map((m) => [m.from, m.to]));
+  assert.strictEqual(to['cat.jpg'], 'Pictures/cat.jpg', 'reuses the Pictures folder you already have');
+  assert.strictEqual(to['Screenshot 2026-11-01 at 09.12.png'], 'Screenshots/Screenshot 2026-11-01 at 09.12.png');
+  assert.strictEqual(to['setup.dmg'], 'Installers/setup.dmg');
+  assert.strictEqual(to['lonely.pdf'], 'Documents/lonely.pdf', 'a lone PDF joins the documents');
+  assert.ok(!to['weird.thing'], 'unknown things stay put');
+  assert.ok(!k.moves.some((m) => m.from.includes('/')), 'nothing inside your folders moves');
+  assert.ok(k.moves.every((m) => m.on));
+  // by date: two different years, so years with months inside
+  put('old-a.txt', 'x', new Date('2024-03-05T12:00:00'));
+  put('old-b.txt', 'x', new Date('2024-03-09T12:00:00'));
+  const d = Quick.byDate(Scan.scan(dir));
+  const a = d.moves.find((m) => m.from === 'old-a.txt');
+  assert.strictEqual(a.to, '2024/03 March/old-a.txt');
+  // everything from one month: nothing to do
+  const one = path.join(tmp, 'one-month');
+  fs.mkdirSync(one);
+  for (const n of ['a.txt', 'b.txt']) fs.writeFileSync(path.join(one, n), 'x');
+  const e = Quick.byDate(Scan.scan(one));
+  assert.strictEqual(e.moves.length, 0);
+  assert.match(e.summary, /wouldn't help/);
+});
+
+test('the screen: pick a folder, see a plan at once, one Enter moves, u undoes', async () => {
   const { App } = require('../src/app');
   const { PassThrough } = require('stream');
+  const A = require('../src/ansi');
+  const plain = (lines) => lines.join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   const input = new PassThrough();
   const output = new PassThrough();
   output.columns = 110; output.rows = 34;
-  const A = require('../src/ansi');
-  const app = new App({ input, output, folder: messy('screen') });
-  for (const level of [2, 3]) {
-    A.setLevel(level);
-    const { lines } = app.frame(110, 34);
-    const text = lines.join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-    assert.match(text, /never deletes/);
-    assert.match(text, /How should I tidy screen\?/);
-    assert.ok(text.includes('▄'), 'Hazel is drawn');
-    assert.ok(!text.includes('▀'), 'no upper half blocks (they leave seams in macOS Terminal)');
-  }
+  // no folder: the picker
+  A.setLevel(3);
+  const picker = new App({ input, output });
+  const p0 = plain(picker.frame(110, 34).lines);
+  assert.match(p0, /Which folder should tidy sort\?/);
+  assert.match(p0, /Somewhere else/);
+  // a folder: the plan is already there, no AI needed
+  const dir = messy('screen');
+  const before = listAll(dir);
+  const app = new App({ input, output, folder: dir });
+  const text = plain(app.frame(110, 34).lines);
+  assert.match(text, /By kind/);
+  assert.match(text, /never deletes/);
+  assert.match(text, /move \d+ things/);
+  assert.match(text, /→ Documents\//, 'a lone essay and a lone budget still make a Documents folder');
+  // Hazel: half blocks normally (never ▀), whole cells in macOS Terminal
+  process.env.TERM_PROGRAM = 'Apple_Terminal';
+  const blocky = app.frame(110, 34).lines.join('\n');
+  delete process.env.TERM_PROGRAM;
+  assert.ok(!/[▀▄]/.test(blocky.replace(/\x1b\[[0-9;]*m/g, '')), 'no half blocks in macOS Terminal');
+  // Enter right after the plan appears is ignored (a double-tap can't move things)
+  app.onKey('', { name: 'return' });
+  assert.strictEqual(app.mode, 'plan');
+  app.calm = 0;
+  app.onKey('', { name: 'return' });
+  assert.strictEqual(app.mode, 'done');
+  assert.ok(fs.existsSync(path.join(dir, 'Documents', 'essay-draft.docx')), 'moved');
+  assert.ok(fs.existsSync(path.join(dir, 'setup-tool.dmg')), 'a single installer stays where it is');
+  assert.match(plain(app.frame(110, 34).lines), /Moved \d+ things/);
+  app.onKey('u', {});
+  assert.deepStrictEqual(listAll(dir), before, 'u put everything back');
   A.setLevel(0);
 });
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+Much less fiddly.
+- **A plan is ready at once.** Pick a folder and tidy has already sorted the loose files by kind (installers, screenshots, documents, pictures…), with no AI and no waiting. **By date** is one key away. Folders you already made are kept and reused.
+- **Fewer steps.** `tidy` on its own shows a short list (Downloads, Desktop, Documents) to pick from. One Enter moves everything; u puts it back.
+- **Asks permission once.** Using a cloud AI, tidy asks one time whether it may see file names, and remembers your answer.
+- **The AI is faster.** Small folders are planned with one question instead of two or more; big ones are planned in batches side by side.
+- **Ask the AI** has ready-made ideas to pick from, and you can look at the other plans while it thinks.
+- A clearer screen: tabs for the ways to sort, every folder in its own colour, and a key bar where the main key stands out.
+- Hazel is drawn in whole blocks in macOS Terminal, so no thin lines run through her.
+- `tidy plan <folder>` with no "how" makes the instant plan.
+
 ## 1.1.0
 - Uses Tree of Thought's free cloud models first (set them up with `tot free`), and moves on to another free model when one is busy or over its limit.
 - Knows the new services (NVIDIA, Ollama Cloud, SambaNova).

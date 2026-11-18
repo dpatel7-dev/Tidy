@@ -9,6 +9,7 @@ const Th = require('./theme');
 const AI = require('./ai');
 const Scan = require('./scan');
 const Plan = require('./plan');
+const Quick = require('./quick');
 const Run = require('./apply');
 const { size, ago } = require('./tui');
 const pkg = require('../package.json');
@@ -16,9 +17,11 @@ const pkg = require('../package.json');
 const HELP = `
   tidy ${pkg.version} - an AI that tidies a folder, carefully
 
-  tidy                         tidy the folder you're in (opens the screen)
-  tidy ~/Downloads             ...or another folder
-  tidy plan <folder> "how"     make a plan and print it (moves nothing)
+  tidy                         pick a folder (Downloads, Desktop…) and sort it
+  tidy ~/Downloads             sort that folder
+  tidy ~/Downloads "how"       ...and ask the AI to sort it your way
+  tidy plan <folder> ["how"]   make a plan and print it (moves nothing)
+                               no "how": sorted by kind at once, no AI needed
   tidy plan <folder> "how" --apply
                                make a plan, show it, and move after you type yes
   tidy undo                    put the last tidy back exactly as it was
@@ -53,7 +56,7 @@ async function main(argv) {
     case 'uninstall': return uninstall(rest.includes('--all'));
     default: {
       if (cmd && cmd.startsWith('-')) throw new Error(`"${cmd}" isn't something tidy knows. Try: tidy help`);
-      const folder = cmd ? path.resolve(cmd.replace(/^~(?=$|\/|\\)/, os.homedir())) : process.cwd();
+      const folder = cmd ? path.resolve(cmd.replace(/^~(?=$|\/|\\)/, os.homedir())) : null;
       if (cmd && !isDir(folder)) throw new Error(`"${cmd}" isn't a folder here. Try: tidy help`);
       if (!process.stdin.isTTY || !process.stdout.isTTY) { out(HELP); return; }
       const { App } = require('./app');
@@ -73,10 +76,16 @@ async function planCmd(args) {
   if (!isDir(folder)) throw new Error(`"${where}" isn't a folder.`);
   const why = Scan.refuse(folder);
   if (why) throw new Error(why);
-  const { model } = await AI.current();
-  if (!model) throw new Error('tidy needs an AI: install Ollama (ollama.com) and run "ollama pull llama3.2", or set up Tree of Thought.');
   const s = Scan.scan(folder);
   if (!s.items.length) throw new Error('There is nothing here to tidy.');
+  if (!words.length || /^by (kind|date)$/i.test(words.join(' ').trim())) { // instant: no AI
+    const plan = /date/i.test(words.join(' ')) ? Quick.byDate(s) : Quick.byKind(s);
+    printPlan(plan);
+    if (!plan.moves.length) return;
+    return maybeApply(plan, yes);
+  }
+  const { model } = await AI.current();
+  if (!model) throw new Error('Asking the AI needs one: install Ollama (ollama.com) and run "ollama pull llama3.2", or set up Tree of Thought. Without "how", tidy plan sorts by kind with no AI.');
   if (!AI.local(model)) out(Th.dim(`  ${model.name} isn't on this computer: tidy sends it file names, sizes, dates and short snippets (private-looking files: name only).`));
   out(Th.dim(`  ${model.name} is looking at ${s.items.length} things in ${tilde(folder)}…`));
   const ac = new AbortController();
@@ -84,20 +93,26 @@ async function planCmd(args) {
   const plan = await Plan.makePlan(model, s, words.join(' '), {
     signal: ac.signal,
     onStep: (p) => { if (process.stderr.isTTY && p.step === 'assign') process.stderr.write(`\r  Deciding where things go: ${p.done} of ${p.total}…   `); },
+    // (small folders are planned in one go, so there's no count to show)
   });
   if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(50) + '\r');
   printPlan(plan);
   if (!plan.moves.length) return;
+  return maybeApply(plan, yes);
+}
+
+async function maybeApply(plan, yes) {
   if (!yes) { out(Th.dim('\n  Nothing moved. Add --apply to move these (you will be asked first), or run tidy to pick moves one by one.')); return; }
   if (!process.stdin.isTTY) throw new Error('To move things, run this in a terminal so tidy can ask you first.');
-  const ans = await question(`\n  Move these ${plan.moves.length}? Type yes: `);
-  if (ans.trim().toLowerCase() !== 'yes') { out('  Nothing moved.'); return; }
+  const ans = await question(`\n  Move these ${plan.moves.length}? (y/n) `);
+  if (!/^y(es)?$/i.test(ans.trim())) { out('  Nothing moved.'); return; }
   const r = Run.apply(plan, {});
   out(`  ${A.paint('✓', { fg: Th.t().ok })} Moved ${r.moved.length}${r.skipped.length ? `, left ${r.skipped.length} where they were` : ''}. ${Th.dim('tidy undo puts them back.')}`);
 }
 
 function printPlan(plan) {
   out('');
+  if (!plan.moves.length) { out('  ' + Th.dim(plan.how === 'ai' ? 'The AI thinks everything is where it belongs.' : plan.summary || 'Nothing to sort.')); return; }
   out('  ' + A.paint(`${plan.moves.length} moves into ${plan.folders.length} folders`, { bold: true }) + Th.dim('  ·  nothing deleted, nothing replaced'));
   if (plan.summary) out('  ' + Th.dim(plan.summary));
   out('');

@@ -12,6 +12,12 @@ const http = require('http');
 const FOLDERS = { image: 'Pictures', video: 'Videos', audio: 'Music', pdf: 'Documents/PDFs', document: 'Documents', spreadsheet: 'Documents/Spreadsheets', slides: 'Documents/Slides', archive: 'Archives', installer: 'Installers', 'text/code': 'Notes and code', '3d model': '3D', font: 'Fonts', project: 'Projects', 'app or bundle': 'Apps' };
 
 function answer(system, user, nasty) {
+  if (/in one go/i.test(system)) { // folders and moves together
+    const { moves } = answer('', user, nasty);
+    const folders = [...new Set(moves.map((m) => m.to))].map((p) => ({ path: p, for: `${String(p).toLowerCase()} go here` }));
+    if (nasty) folders.push({ path: '../Escape', for: 'outside' }, { path: '/etc', for: 'system' }, { path: '.hidden', for: 'hidden' }, { path: 'a/b/c/d/e', for: 'too deep' }, { path: 'CON', for: 'reserved' });
+    return { summary: 'Everything sorted into folders by what kind of file it is.', folders: folders.filter((f) => !/^(\.\.\/Escape|\/etc|Not\/Designed|DELETE)$/.test(f.path)), moves };
+  }
   if (/design a folder structure/i.test(system)) {
     const kinds = JSON.parse((user.match(/Kinds: (\{.*\})/) || [0, '{}'])[1]);
     const folders = [...new Set(Object.keys(kinds).map((k) => FOLDERS[k]).filter(Boolean))].map((p) => ({ path: p, for: `${p.toLowerCase()} go here` }));
