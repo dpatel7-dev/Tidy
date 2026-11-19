@@ -29,7 +29,7 @@ const Plan = require('./plan');
 const Quick = require('./quick');
 const Run = require('./apply');
 const { Editor } = require('./editor');
-const { Tui, fit, spread, size, ago, bar } = require('./tui');
+const { Tui, fit, spread, size, ago, bar, open: openThing } = require('./tui');
 const pkg = require('../package.json');
 
 const tilde = (p) => (p.startsWith(os.homedir()) ? '~' + p.slice(os.homedir().length) : p);
@@ -216,7 +216,12 @@ class App {
     const n = p.moves.filter((m) => m.on).length;
     if (!n) return this.say('Every move is switched off. Space switches one back on, a switches them all.', 'warn');
     this.react('work');
-    this.result = Run.apply(p, { prune: this.prune });
+    try {
+      this.result = Run.apply(p, { prune: this.prune });
+    } catch (e) {
+      this.react('oops');
+      return this.say(`Couldn't move things: ${e.message}. Nothing was lost; try again, or press u if some moved.`, 'err', 15000);
+    }
     const where = new Map();
     for (const m of this.result.moved) { const top = path.posix.dirname(m.to).split('/')[0]; where.set(top, (where.get(top) || 0) + 1); }
     this.result.where = [...where.entries()].map(([name, n]) => ({ name, n, hue: this.hueOf(p, name) }));
@@ -224,7 +229,8 @@ class App {
     this.flash = null;
     try { this.scanned = Scan.scan(this.folder); } catch { /* the header can wait */ }
     this.mode = 'done';
-    this.react('done');
+    this.react(this.result.moved.length ? 'done' : 'oops');
+    this.guard();
     this.dirty();
   }
 
@@ -262,6 +268,7 @@ class App {
 
   // ── keys ────────────────────────────────────────────────────────────────────
   onKey(s, k) {
+    if (k.name === 'enter') k = { ...k, name: 'return' }; // some keyboards send \n for Enter
     if (k.ctrl && (k.name === 'c' || k.name === 'd')) return this.quit();
     if (k.ctrl && k.name === 't') { Th.use(Th.name() === 'walnut' ? 'linen' : 'walnut'); AI.config.save({ ...AI.config.load(), theme: Th.name() }); this.ui.setPaper(Th.t().paper); return this.dirty(); }
     if (this.consent) {
@@ -295,8 +302,10 @@ class App {
     }
     if (m === 'done') {
       if (s === 'u') this.undoHere();
-      else if (k.name === 'return' || k.name === 'escape') { this.refresh(); this.mode = 'plan'; this.react('idle'); this.guard(); }
-      else if (s === 'q') return this.quit();
+      else if (s === 'o') { openThing(this.folder); this.say(`Opened ${path.basename(this.folder)} in ${process.platform === 'darwin' ? 'Finder' : 'your file browser'}.`, 'ok'); }
+      else if (k.name === 'return') { if (Date.now() >= this.calm) return this.quit(); }
+      else if (s === 'b' || k.name === 'left' || k.name === 'backspace') { this.refresh(); this.mode = 'plan'; this.react('idle'); this.guard(); }
+      else if (s === 'q' || k.name === 'escape') return this.quit();
       return this.dirty();
     }
     // the plan screen
@@ -323,7 +332,13 @@ class App {
     else if (s === 'p') { this.prune = !this.prune; this.say(this.prune ? 'Folders this leaves empty will be removed too (undo brings them back).' : 'Empty folders will be left alone.'); }
     else if (s === 'u') this.undoHere();
     else if ((s === 'e' || s === '/') && this.way === 'ai' && !this.ai.thinking) { this.ai.asking = true; this.ed.set(this.ai.request); }
-    else if (k.name === 'return') { if (Date.now() >= this.calm) this.applyPlan(); }
+    else if (k.name === 'return') {
+      const p = this.plan();
+      if (Date.now() < this.calm) { /* a fresh plan: wait a moment */ }
+      else if (this.way === 'ai' && p && !p.moves.length) { this.ai.asking = true; this.ed.set(this.ai.request); }
+      else if (!p || !p.moves.length) this.say(this.way === 'ai' ? 'Type what you want first, then press Enter.' : 'Nothing to move this way. Use ←→ to look at the other ways.', 'warn');
+      else this.applyPlan();
+    }
     else if (k.name === 'escape') { if (this.way === 'ai' && this.ai.thinking) { this.ac.abort(); this.say('Stopped. Nothing was moved.'); } else return this.quit(); }
     else if (s === 'q') return this.quit();
     this.dirty();
@@ -364,7 +379,14 @@ class App {
       out.push(' ' + Th.acorn(label, { bold: true }) + lay.lines[0]);
       cursor = { row: out.length - 1, col: 1 + label.length + lay.col };
     } else if (f) out.push(' ' + A.clip(A.paint(f.text, { fg: t[f.kind] || t.dim }), W - 2));
-    else out.push(' ' + Th.faint(W >= 90 ? 'only moves things into folders  ·  never deletes or replaces anything  ·  u undoes' : 'only moves things  ·  never deletes or replaces  ·  u undoes'));
+    else if (this.mode === 'plan' && !this.typing() && this.plan() && this.plan().moves.some((m) => m.on)) {
+      const p = this.plan();
+      const on = p.moves.filter((m) => m.on);
+      const into = new Set(on.map((m) => path.posix.dirname(m.to).split('/')[0])).size;
+      const go = `Press Enter to move ${plural(on.length, 'thing')} into ${plural(into, 'folder')}.`;
+      const safe = W >= 100 ? '  Nothing gets deleted, and u puts it all back.' : W >= 70 ? '  Nothing gets deleted.' : '';
+      out.push(' ' + A.paint(go, { fg: t.cream, bold: true }) + Th.dim(safe));
+    } else out.push(' ' + Th.faint(W >= 90 ? 'only moves things into folders  ·  never deletes or replaces anything  ·  u undoes' : 'only moves things  ·  never deletes or replaces  ·  u undoes'));
     out.push(this.keyBar(W));
     return { lines: out.slice(0, H), cursor };
   }
@@ -378,14 +400,15 @@ class App {
     if (this.consent) keys = [['y', 'allow', true], ['n', 'not now'], ['ctrl+o', 'another AI']];
     else if (this.mode === 'pick') keys = [['enter', 'open', true], ['↑↓', 'choose'], ['esc', this.folder ? 'back' : 'quit']];
     else if (this.mode === 'path') keys = [['enter', 'open', true], ['esc', 'back']];
-    else if (this.mode === 'done') keys = [['u', 'put it all back', true], ['enter', 'keep going'], ['q', 'quit']];
+    else if (this.mode === 'done') keys = this.result && this.result.moved.length ? [['enter', 'all done', true], ['o', 'show me'], ['u', 'put it all back'], ['b', 'sort more']] : [['b', 'go back', true], ['enter', 'close tidy']];
     else if (this.typing()) keys = [['enter', 'ask the AI', true], ['↑↓', 'pick an idea'], ['ctrl+o', 'another AI'], ['esc', this.ai.plan ? 'back to the plan' : 'back']];
+    else if (this.way === 'ai' && p && !p.moves.length) keys = [['enter', 'ask again', true], ['←→', 'another way'], ['ctrl+o', 'another AI'], ['esc', 'quit']];
     else if (this.way === 'ai' && this.ai.thinking) keys = [['esc', 'stop'], ['←→', 'look at another way']];
     else {
       keys = [];
       if (on) keys.push(['enter', `move ${plural(on, 'thing')}`, true]);
       keys.push(['←→', 'another way']);
-      if (p && p.moves.length) keys.push(['space', 'skip']);
+      if (p && p.moves.length) keys.push(['space', 'leave one']);
       if (this.way === 'ai') keys.push(['e', 'ask differently']);
       if (this.lastHere) keys.push(['u', 'undo last tidy']);
       keys.push(['tab', 'other folder'], ['esc', 'quit']);
@@ -529,7 +552,11 @@ class App {
     if (this.scanned && !this.scanned.items.length) lines.push(A.paint(`${path.basename(this.folder)} is empty.`, { bold: true }), '', ...para('There is nothing here to sort. Press Tab to pick another folder.', Th.dim));
     else if (p.how === 'kind') lines.push(A.paint('Nothing to sort by kind.', { bold: true }), '', ...para('The loose files here are already in folders, or there is only one of each kind.', Th.dim));
     else if (p.how === 'date') lines.push(A.paint('Nothing to sort by date.', { bold: true }), '', ...para(p.summary, Th.dim));
-    else lines.push(A.paint('The AI thinks everything is where it belongs.', { bold: true }), '', ...para('Press e and say more about what you want.', Th.dim));
+    else {
+      const lost = Object.values(p.dropped || {}).reduce((a, b) => a + b, 0);
+      if (lost) lines.push(A.paint("The AI's answer didn't fit the files here.", { bold: true }), '', ...para(`It suggested ${plural(lost, 'move')}, but none of them pointed at real files and sensible folders, so tidy left everything alone. Press Enter to ask again, or Ctrl+O to try a different AI.`, Th.dim));
+      else lines.push(A.paint('The AI thinks everything is where it belongs.', { bold: true }), '', ...para('Press Enter and say more about what you want.', Th.dim));
+    }
     if (this.scanned && this.scanned.items.length) lines.push('', ...para(p.how === 'ai' ? 'Use ←→ to see the other ways.' : 'Use ←→ to see the other ways, or ask the AI for something smarter.', Th.cream));
     return this.beside('oops', lines, W).lines;
   }
@@ -574,7 +601,18 @@ class App {
   doneLines(W) {
     const r = this.result;
     const t = Th.t();
-    const right = [A.paint(`Moved ${plural(r.moved.length, 'thing')}${r.into ? ` into ${plural(r.into, 'folder')}` : ''}.`, { bold: true, fg: t.ok })];
+    if (!r.moved.length) {
+      const why = [A.paint('Nothing was moved.', { bold: true, fg: t.warn }), ''];
+      if (r.skipped.length) {
+        why.push(Th.dim(`tidy checked all ${plural(r.skipped.length, 'move')} and stopped ${r.skipped.length === 1 ? 'it' : 'them'} to keep your files safe:`), '');
+        const reasons = new Map();
+        for (const x of r.skipped) reasons.set(x.why, (reasons.get(x.why) || 0) + 1);
+        for (const [w, n] of [...reasons.entries()].slice(0, 5)) why.push(Th.cream(`  ${plural(n, 'thing')}: `) + Th.dim(w));
+        why.push('', Th.dim('Press b to look again; tidy reads the folder fresh.'));
+      } else why.push(Th.dim('Every move was switched off.'));
+      return this.beside('oops', why, W).lines;
+    }
+    const right = [A.paint(`Done! Moved ${plural(r.moved.length, 'thing')}${r.into ? ` into ${plural(r.into, 'folder')}` : ''}.`, { bold: true, fg: t.ok })];
     if (r.where.length) {
       right.push('');
       const chips = r.where.map((x) => A.paint(x.name + '/', { fg: x.hue, bold: true }) + Th.faint(' ' + x.n));
@@ -588,7 +626,8 @@ class App {
       for (const s of r.skipped.slice(0, 4)) right.push(Th.dim(`  ${A.clip(s.from, 40)}: ${s.why}`));
     }
     right.push('', Th.cream('Changed your mind? Press u and everything goes back where it was.'));
-    right.push(Th.faint(`You can also undo it later with: tidy undo`));
+    right.push(Th.faint('Later, you can undo it by typing: tidy undo'));
+    right.push('', Th.dim('Press Enter to close tidy.'));
     return this.beside(this.mood.scene, right, W).lines;
   }
 }

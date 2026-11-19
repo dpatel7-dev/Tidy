@@ -59,7 +59,7 @@ async function assign(model, s, design_, request, { signal, onBatch = () => {} }
       const k = next++;
       const user = `What the person wants: ${request || 'tidy it up sensibly'}\n\nFolders:\n${list}\n\nItems (number. path | kind size | date | what it says):\n${batches[k].map(line).join('\n')}`;
       const j = await AI.askJson(model, system, user, { signal });
-      results[k] = Array.isArray(j.moves) ? j.moves : [];
+      results[k] = movesOf(j);
       done += batches[k].length;
       onBatch(done, items.length);
     }
@@ -95,11 +95,41 @@ function validate(s, design_, raw) {
   const used = new Set();
   const out = [];
   const dropped = { unknown: 0, folder: 0, same: 0, clash: 0, inside: 0 };
+  // AIs don't all answer the same way: some say "item" or "file" instead of
+  // "i", some give the name instead of the number, some put the file name on
+  // the end of the folder. Understand all of those.
+  const listedNone = !design_.folders.length;
+  const tops = new Set([...allowed.values()].filter(Boolean).map((f) => f.split('/')[0].toLowerCase()));
+  const byRel = new Map(s.items.map((x) => [x.rel.toLowerCase(), x]));
+  const byName = new Map();
+  for (const x of s.items) { const k = x.name.toLowerCase(); byName.set(k, byName.has(k) ? null : x); } // null: two share it
+  const find = (m) => {
+    if (m == null) return null;
+    if (typeof m !== 'object') return find({ i: m });
+    for (const key of ['i', 'item', 'n', 'index', 'id', 'number', 'num']) {
+      const v = m[key];
+      if (typeof v === 'number' && s.items[v]) return s.items[v];
+      if (typeof v === 'string' && /^\s*#?\d+\.?\s*$/.test(v) && s.items[parseInt(v.replace(/\D/g, ''), 10)]) return s.items[parseInt(v.replace(/\D/g, ''), 10)];
+    }
+    for (const key of ['from', 'path', 'file', 'name', 'item', 'source']) {
+      const v = typeof m[key] === 'string' ? m[key].replace(/\\/g, '/').replace(/^\.?\/+|\/+$/g, '').replace(/^\d+\.\s+/, '').toLowerCase() : '';
+      if (v && byRel.has(v)) return byRel.get(v);
+      if (v && byName.get(v)) return byName.get(v);
+    }
+    return null;
+  };
   for (const m of raw) {
-    const it = s.items[Number(m && m.i)];
+    const it = find(m);
     if (!it) { dropped.unknown++; continue; }
     if (used.has(it.i)) continue;
-    const dest = allowed.get(String((m && m.to) || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase());
+    let want = String((m && (m.to || m.folder || m.dest || m.destination || m.into || m.move_to)) || '').replace(/\\/g, '/').replace(/^\.?\/+|\/+$/g, '');
+    if (want.toLowerCase().endsWith('/' + it.name.toLowerCase())) want = want.slice(0, -(it.name.length + 1)); // "Pictures/cat.png" means "Pictures"
+    let dest = allowed.get(want.toLowerCase());
+    if (dest === undefined) { // a folder it didn't list: fine inside one it did ("Documents/PDF" for "Documents/PDFs"), or if it listed none
+      const clean = cleanFolder(want);
+      const top = clean && clean.split('/')[0].toLowerCase();
+      if (clean && (listedNone || tops.has(top)) && !inUnit(clean) && design_.folders.length < MAX_FOLDERS) { design_.folders.push({ path: clean, for: '' }); allowed.set(clean.toLowerCase(), clean); tops.add(top); dest = clean; }
+    }
     if (dest === undefined) { dropped.folder++; continue; }
     const from = it.rel;
     const parent = path.posix.dirname(from) === '.' ? '' : path.posix.dirname(from);
@@ -123,6 +153,13 @@ function validate(s, design_, raw) {
   return { moves: out, dropped };
 }
 
+/** The list of moves in an answer, whatever the AI called it. */
+function movesOf(j) {
+  for (const k of ['moves', 'items', 'plan', 'files', 'assignments', 'result']) if (Array.isArray(j && j[k])) return j[k];
+  if (j && j.moves && typeof j.moves === 'object') return Object.entries(j.moves).map(([k, to]) => ({ ...(/^\d+$/.test(k) ? { i: Number(k) } : { from: k }), ...(typeof to === 'string' ? { to } : to) })); // {"3": "Pictures"} or {"cat.png": "Pictures"}
+  return [];
+}
+
 /** Small folders: the folders and the moves in one question, so it's quick. */
 async function oneGo(model, s, request, { signal } = {}) {
   const ov = overview(s);
@@ -135,8 +172,9 @@ async function oneGo(model, s, request, { signal } = {}) {
     if (p && !folders.some((x) => x.path.toLowerCase() === p.toLowerCase())) folders.push({ path: p, for: String((f && f.for) || '').slice(0, 160) });
     if (folders.length >= MAX_FOLDERS) break;
   }
-  if (!folders.length) throw new Error("The AI didn't suggest any folders. Try saying a bit more about what you want.");
-  return { design: { summary: String(j.summary || '').slice(0, 300), folders }, raw: Array.isArray(j.moves) ? j.moves : [] };
+  const raw = movesOf(j);
+  if (!folders.length && !raw.length) throw new Error("The AI didn't suggest any folders. Try saying a bit more about what you want.");
+  return { design: { summary: String(j.summary || '').slice(0, 300), folders }, raw };
 }
 
 /** Up to this many items are planned with a single question. */

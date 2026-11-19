@@ -232,7 +232,8 @@ test('the screen: pick a folder, see a plan at once, one Enter moves, u undoes',
   const app = new App({ input, output, folder: dir });
   const text = plain(app.frame(110, 34).lines);
   assert.match(text, /By kind/);
-  assert.match(text, /never deletes/);
+  assert.match(text, /Press Enter to move \d+ things/);
+  assert.match(text, /Nothing gets deleted/);
   assert.match(text, /move \d+ things/);
   assert.match(text, /→ Documents\//, 'a lone essay and a lone budget still make a Documents folder');
   // Hazel: half blocks normally (never ▀), whole cells in macOS Terminal
@@ -265,3 +266,20 @@ function listAll(dir) {
   walk('');
   return out;
 }
+
+test('answers in other shapes still become plans (thinking models, names instead of numbers)', () => {
+  const AI = require('../src/ai');
+  const Plan = require('../src/plan');
+  assert.deepStrictEqual(AI.parseJson('<think>maybe {a} or {b}</think>Sure! {"moves":[{"i":1,"to":"X"},]}'), { moves: [{ i: 1, to: 'X' }] });
+  assert.deepStrictEqual(AI.parseJson('So {thinking} first.\n```json\n{"moves": []}\n```'), { moves: [] });
+  const s = { root: tmp, dirs: ['Pictures'], items: [
+    { i: 0, rel: 'cat.png', name: 'cat.png', isDir: false, size: 1 },
+    { i: 1, rel: 'a.pdf', name: 'a.pdf', isDir: false, size: 2 },
+    { i: 2, rel: 'song.mp3', name: 'song.mp3', isDir: false, size: 3 },
+  ] };
+  const d = { folders: [{ path: 'Documents/PDFs' }, { path: 'Music' }] };
+  const raw = [{ item: '0', folder: 'Pictures/' }, { file: 'a.pdf', to: 'Documents/PDF/a.pdf' }, { i: '#2', destination: 'music' }, { name: 'nope.txt', to: 'Music' }, { i: 1, to: 'Elsewhere' }];
+  const { moves, dropped } = Plan.validate(s, d, raw);
+  assert.deepStrictEqual(moves.map((m) => [m.from, m.to]).sort(), [['a.pdf', 'Documents/PDF/a.pdf'], ['cat.png', 'Pictures/cat.png'], ['song.mp3', 'Music/song.mp3']]);
+  assert.strictEqual(dropped.unknown, 1);
+});

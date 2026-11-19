@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0
+Enter works every time.
+- **Fixed: pressing Enter on an AI plan sometimes did nothing.** Two causes. First, if Project CLI Access updated itself while tidy was open, both programs read your keys and some presses went to the wrong one (fixed in pca 1.5.0). Second, some AIs answer in a slightly different shape (a name instead of a number, the file name on the end of a folder, thinking out loud first); tidy now understands those instead of quietly dropping every move.
+- **Enter always does something you can see.** A clear line above the keys says "Press Enter to move 19 things into 4 folders". If nothing could move, tidy says why instead of staying silent. If the AI's answer didn't fit, Enter asks it again.
+- **A simpler finish.** After moving: Enter closes tidy, o shows the folder in Finder, u puts everything back, b sorts more.
+
 ## 1.2.0
 Much less fiddly.
 - **A plan is ready at once.** Pick a folder and tidy has already sorted the loose files by kind (installers, screenshots, documents, pictures…), with no AI and no waiting. **By date** is one key away. Folders you already made are kept and reused.

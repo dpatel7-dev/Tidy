@@ -53,6 +53,19 @@ function start(port = 0, { nasty = !!process.env.FAKE_NASTY, model = 'tidy-test:
         const reply = '```json\n' + JSON.stringify(answer(sys, user, nasty), null, 1) + '\n```';
         return res.end(JSON.stringify({ model: j.model, message: { role: 'assistant', content: reply }, done: true }));
       }
+      if (req.url === '/v1/chat/completions') { // a cloud service (OpenRouter, Groq…): streamed, any model name
+        const j = JSON.parse(body || '{}');
+        log.push(j);
+        const sys = (j.messages.find((m) => m.role === 'system') || {}).content || '';
+        const user = (j.messages.find((m) => m.role === 'user') || {}).content || '';
+        const reply = 'Here is the plan:\n```json\n' + JSON.stringify(answer(sys, user, nasty), null, 1) + '\n```';
+        res.setHeader('content-type', 'text/event-stream');
+        const send = (o) => res.write('data: ' + JSON.stringify(o) + '\n\n');
+        send({ choices: [{ delta: { reasoning: 'Thinking about {folders} and [items]... ' } }] });
+        for (let k = 0; k < reply.length; k += 400) send({ choices: [{ delta: { content: reply.slice(k, k + 400) } }] });
+        res.end('data: [DONE]\n\n');
+        return;
+      }
       res.statusCode = 404;
       res.end('{}');
     });

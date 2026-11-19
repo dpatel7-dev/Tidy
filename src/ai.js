@@ -58,14 +58,21 @@ function choose(m) { config.save({ ...config.load(), model: keyOf(m) }); }
 
 /** Pull a JSON object out of a model's answer (it may wrap it in ``` or chat around it). */
 function parseJson(text) {
-  let t = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
-  const a = t.indexOf('{');
+  // thinking models (DeepSeek R1 and friends) may think out loud first, braces and all
+  let t = String(text || '').replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim();
+  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const tries = [];
+  if (fenced) tries.push(fenced[1]);
   const b = t.lastIndexOf('}');
-  if (a < 0 || b < a) throw new Error("The AI didn't answer with a plan.");
-  t = t.slice(a, b + 1);
-  try { return JSON.parse(t); } catch {
-    return JSON.parse(t.replace(/,\s*([}\]])/g, '$1').replace(/[“”]/g, '"')); // trailing commas, curly quotes
+  // every '{' could be where the answer starts: try them in order (a few dozen at most)
+  for (let a = t.indexOf('{'), n = 0; a >= 0 && a < b && n < 40; a = t.indexOf('{', a + 1), n++) tries.push(t.slice(a, b + 1));
+  const soft = (s) => s.replace(/,\s*([}\]])/g, '$1').replace(/[“”]/g, '"').replace(/^\s*\/\/.*$/gm, ''); // trailing commas, curly quotes, comments
+  for (const s of tries) {
+    for (const f of [(x) => x, soft]) {
+      try { const j = JSON.parse(f(s.trim())); if (j && typeof j === 'object' && !Array.isArray(j)) return j; if (Array.isArray(j)) return { moves: j }; } catch { /* next */ }
+    }
   }
+  throw new Error("The AI didn't answer with a plan.");
 }
 
 /** Ask once and get JSON back (retries once if the answer wasn't JSON). */
